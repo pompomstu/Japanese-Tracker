@@ -11,7 +11,8 @@
     'use strict';
 
     // ---------- Config ----------
-    const EPISODES_PER_DAY = 12;
+    const DEFAULT_EPISODES_PER_DAY = 12;
+    const DEFAULT_DAY_GRID_COLUMNS = 6;
     const ROLLING_DEFAULT = 5;  // minimum enforced
     const KEYS = {
         SETTINGS:   'netflixAnimeSettings',
@@ -80,10 +81,22 @@
         dailyColor:   '#0f0',
         episodeMinutes: 25,
         showLabel: 'default',
-        rollingWindow: ROLLING_DEFAULT
+        rollingWindow: ROLLING_DEFAULT,
+        episodesPerDay: DEFAULT_EPISODES_PER_DAY,
+        dayGridColumns: DEFAULT_DAY_GRID_COLUMNS,
+        showPresets: [],
+        movieRules: [],
+        plannerPreviewUnits: DEFAULT_EPISODES_PER_DAY,
+        showPriority: []
     });
     // Enforce minimum rolling window of 5 on load
     settings.rollingWindow = Math.max(ROLLING_DEFAULT, Math.round(settings.rollingWindow || ROLLING_DEFAULT));
+    settings.episodesPerDay = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
+    settings.dayGridColumns = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
+    settings.showPresets = Array.isArray(settings.showPresets) ? settings.showPresets : [];
+    settings.movieRules = Array.isArray(settings.movieRules) ? settings.movieRules : [];
+    settings.plannerPreviewUnits = clamp(Math.round(settings.plannerPreviewUnits || DEFAULT_EPISODES_PER_DAY), 1, 50, DEFAULT_EPISODES_PER_DAY);
+    settings.showPriority = Array.isArray(settings.showPriority) ? settings.showPriority : [];
     save(KEYS.SETTINGS, settings);
 
     let durationsByLabel = normalizeDurations(load(KEYS.DURATIONS, {}));
@@ -226,31 +239,60 @@
     function buildDayBoxContainer() {
         const container = document.createElement('div');
         container.style.display = 'flex';
-        container.style.flexDirection = 'column';
-        container.style.gap = '4px';
+        container.style.alignItems = 'flex-start';
+        container.style.gap = '6px';
 
-        for (let row = 0; row < 2; row++) {
-            const rowContainer = document.createElement('div');
-            rowContainer.style.display = 'flex';
-            rowContainer.style.gap = '8px';
-            for (let pair = 0; pair < 3; pair++) {
-                const startIndex = row * 6 + pair * 2;
+        const dividerInterval = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
+        const totalEpisodes = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
+        const columnsPerRow = Math.max(1, Math.ceil(totalEpisodes / 2));
+
+        for (let col = 0; col < columnsPerRow; col++) {
+            const column = document.createElement('div');
+            column.style.display = 'flex';
+            column.style.flexDirection = 'column';
+            column.style.gap = '4px';
+
+            for (let row = 0; row < 2; row++) {
+                const index = row * columnsPerRow + col;
                 const todayKey = getTodayLocal();
-                const filledCount = Math.max(
-                    0,
-                    Math.min(2, (markedEpisodes[todayKey] || 0) - startIndex)
-                );
-                const boxPair = createBoxRow(2, filledCount, i => {
-                    const clickedIndex = startIndex + i;
-                    const count = markedEpisodes[todayKey] || 0;
-                    markedEpisodes[todayKey] = clickedIndex < count ? count - 1 : count + 1;
-                    markedEpisodes[todayKey] = Math.max(0, Math.min(EPISODES_PER_DAY, markedEpisodes[todayKey]));
-                    save(KEYS.MARKED, markedEpisodes);
-                    updateUI();
-                }, settings.dailyColor);
-                rowContainer.appendChild(boxPair);
+                const count = markedEpisodes[todayKey] || 0;
+
+                const box = document.createElement('div');
+                Object.assign(box.style, {
+                    width: '12px',
+                    height: '12px',
+                    border: '1px solid white',
+                    borderRadius: '2px',
+                    backgroundColor: index < totalEpisodes && index < count ? settings.dailyColor : 'transparent',
+                    cursor: index < totalEpisodes ? 'pointer' : 'default',
+                    visibility: index < totalEpisodes ? 'visible' : 'hidden'
+                });
+
+                if (index < totalEpisodes) {
+                    box.addEventListener('click', () => {
+                        const clickedIndex = index;
+                        const currentCount = markedEpisodes[todayKey] || 0;
+                        markedEpisodes[todayKey] = clickedIndex < currentCount ? currentCount - 1 : currentCount + 1;
+                        markedEpisodes[todayKey] = Math.max(0, Math.min(totalEpisodes, markedEpisodes[todayKey]));
+                        save(KEYS.MARKED, markedEpisodes);
+                        updateUI();
+                    });
+                }
+                column.appendChild(box);
             }
-            container.appendChild(rowContainer);
+
+            container.appendChild(column);
+
+            if ((col + 1) % dividerInterval === 0 && col + 1 < columnsPerRow) {
+                const divider = document.createElement('div');
+                Object.assign(divider.style, {
+                    width: '1px',
+                    height: '30px',
+                    backgroundColor: 'rgba(255,255,255,0.4)',
+                    marginTop: '1px'
+                });
+                container.appendChild(divider);
+            }
         }
         return container;
     }
@@ -323,6 +365,21 @@
     let lastDayBoxKey = getTodayLocal();
     let lastMarkedCount = markedEpisodes[lastDayBoxKey] || 0;
     collapsibleBlock.appendChild(dayBoxContainer);
+
+    // Planner preview
+    const plannerBlock = document.createElement('div');
+    plannerBlock.style.display = 'flex';
+    plannerBlock.style.flexDirection = 'column';
+    plannerBlock.style.gap = '4px';
+    const plannerTitle = document.createElement('div');
+    plannerTitle.textContent = 'Plan';
+    plannerTitle.style.fontWeight = 'bold';
+    const plannerList = document.createElement('div');
+    plannerList.style.display = 'flex';
+    plannerList.style.flexDirection = 'column';
+    plannerList.style.gap = '2px';
+    plannerBlock.append(plannerTitle, plannerList);
+    collapsibleBlock.appendChild(plannerBlock);
 
     function refreshDayBoxesIfNeeded() {
         const todayKey = getTodayLocal();
@@ -545,7 +602,11 @@
     gearBtn.onclick = () => openSettings();
 
     function openSettings() {
+        const existing = document.getElementById('netflixTrackerSettings');
+        if (existing) existing.remove();
+
         const menu = document.createElement('div');
+        menu.id = 'netflixTrackerSettings';
         Object.assign(menu.style, {
             position: 'fixed',
             top: '50%',
@@ -558,8 +619,10 @@
             fontFamily: 'Arial, sans-serif',
             zIndex: 10000,
             width: '380px',
+            pointerEvents: 'auto',
             boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
         });
+        menu.addEventListener('mousedown', e => e.stopPropagation());
 
         const title = document.createElement('div');
         title.textContent = 'Settings';
@@ -574,7 +637,13 @@
         const [dayColorRow, dayColorInput] = mkColor('Daily Box', settings.dailyColor);
         const [epLenRow, epLenInput] = mkNum('Fallback ep length (min)', settings.episodeMinutes, 1, 300, 1);
         const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
-        const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+        const [presetRow, presetSelect, presetAddBtn, presetRemoveBtn] = mkPresetControls('Show presets');
+        const [rollRow, rollInput] = mkNum('Avg episode window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+        const [rulesTitle, rulesWrap, ruleRows, addRuleBtn] = mkMovieRules('Movie insert rules');
+        const [previewRow, previewInput] = mkNum('Planner preview (units)', settings.plannerPreviewUnits, 1, 50, 1, '70px');
+        const [priorityTitle, priorityWrap, priorityRows, addPriorityBtn] = mkPriorityList('Show priority list');
+        const [episodesRow, episodesInput] = mkNum('Episodes per day', settings.episodesPerDay, 1, 100, 1, '70px');
+        const [columnsRow, columnsInput] = mkNum('Divider every N episodes', settings.dayGridColumns, 1, 20, 1, '70px');
 
         const editsTitle = document.createElement('div');
         editsTitle.textContent = `Last 5 durations for "${settings.showLabel}"`;
@@ -693,6 +762,34 @@
                 ROLLING_DEFAULT,
                 Math.min(50, Math.round(parseFloat(rollInput.value) || settings.rollingWindow))
             );
+            settings.episodesPerDay = clamp(
+                Math.round(parseFloat(episodesInput.value) || settings.episodesPerDay),
+                1,
+                100,
+                DEFAULT_EPISODES_PER_DAY
+            );
+            settings.dayGridColumns = clamp(
+                Math.round(parseFloat(columnsInput.value) || settings.dayGridColumns),
+                1,
+                20,
+                DEFAULT_DAY_GRID_COLUMNS
+            );
+            settings.plannerPreviewUnits = clamp(
+                Math.round(parseFloat(previewInput.value) || settings.plannerPreviewUnits),
+                1,
+                50,
+                DEFAULT_EPISODES_PER_DAY
+            );
+            settings.movieRules = ruleRows.map(row => ({
+                show: (row.show.value || '').trim(),
+                title: (row.title.value || '').trim(),
+                afterEpisode: Math.max(1, Math.round(parseFloat(row.afterEpisode.value) || 1)),
+                countsAs: Math.max(1, Math.round(parseFloat(row.countsAs.value) || 1))
+            })).filter(rule => rule.show && rule.title);
+            settings.showPriority = priorityRows.map(row => ({
+                show: (row.show.value || '').trim(),
+                nextEpisode: Math.max(1, Math.round(parseFloat(row.nextEpisode.value) || 1))
+            })).filter(item => item.show);
 
             save(KEYS.SETTINGS, settings);
             overlay.style.background = `rgba(0,0,0,${settings.opacity})`;
@@ -740,12 +837,31 @@
 
         menu.append(
             title,
+            sectionTitle('HUD & Colors'),
             opacityRow,
             epColorRow,
             dayColorRow,
+            sectionDivider(),
+            sectionTitle('Stopwatch'),
             epLenRow,
             labelRow,
+            presetRow,
             rollRow,
+            sectionDivider(),
+            sectionTitle('Daily Goal Layout'),
+            episodesRow,
+            columnsRow,
+            sectionDivider(),
+            rulesTitle,
+            rulesWrap,
+            addRuleBtn,
+            sectionDivider(),
+            sectionTitle('Planner'),
+            previewRow,
+            priorityTitle,
+            priorityWrap,
+            addPriorityBtn,
+            sectionDivider(),
             editsTitle,
             editsWrap,
             buttons
@@ -778,6 +894,17 @@
             });
             wrap.append(span, input);
             return [wrap, input];
+        }
+
+        function styleField(input) {
+            Object.assign(input.style, {
+                background: '#222',
+                color: 'white',
+                border: '1px solid #666',
+                borderRadius: '4px',
+                padding: '4px',
+                width: '100%'
+            });
         }
 
         function mkColor(label, value) {
@@ -819,6 +946,312 @@
             wrap.append(span, input);
             return [wrap, input];
         }
+
+        function mkPresetControls(label) {
+            const wrap = document.createElement('label');
+            wrap.style.display = 'flex';
+            wrap.style.justifyContent = 'space-between';
+            wrap.style.alignItems = 'center';
+            wrap.style.margin = '8px 0';
+
+            const span = document.createElement('span');
+            span.textContent = label;
+
+            const controlWrap = document.createElement('div');
+            controlWrap.style.display = 'flex';
+            controlWrap.style.alignItems = 'center';
+            controlWrap.style.gap = '6px';
+
+            const select = document.createElement('select');
+            Object.assign(select.style, {
+                background: '#222',
+                color: 'white',
+                border: '1px solid #666',
+                borderRadius: '4px',
+                padding: '4px',
+                width: '140px'
+            });
+
+            const addBtn = document.createElement('button');
+            addBtn.textContent = 'Add';
+            styleBtn(addBtn);
+            addBtn.style.padding = '3px 8px';
+
+            const removeBtn = document.createElement('button');
+            removeBtn.textContent = 'Remove';
+            styleBtn(removeBtn);
+            removeBtn.style.padding = '3px 8px';
+
+            const buildPresetOptions = () => {
+                const ordered = Array.from(new Set(settings.showPresets))
+                    .filter(Boolean)
+                    .sort((a, b) => a.localeCompare(b));
+
+                select.innerHTML = '';
+                if (!ordered.length) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'No presets';
+                    select.appendChild(option);
+                    select.disabled = true;
+                    removeBtn.disabled = true;
+                    return;
+                }
+
+                ordered.forEach(value => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value;
+                    select.appendChild(option);
+                });
+                select.disabled = false;
+                removeBtn.disabled = false;
+                select.value = (labelInput.value || settings.showLabel || '').trim() || ordered[0];
+            };
+
+            select.addEventListener('change', () => {
+                labelInput.value = select.value;
+            });
+
+            addBtn.addEventListener('click', () => {
+                const value = (labelInput.value || '').trim();
+                if (!value) return;
+                if (!settings.showPresets.includes(value)) {
+                    settings.showPresets.push(value);
+                    settings.showPresets.sort((a, b) => a.localeCompare(b));
+                    save(KEYS.SETTINGS, settings);
+                }
+                buildPresetOptions();
+                select.value = value;
+            });
+
+            removeBtn.addEventListener('click', () => {
+                const value = select.value;
+                if (!value) return;
+                settings.showPresets = settings.showPresets.filter(item => item !== value);
+                save(KEYS.SETTINGS, settings);
+                buildPresetOptions();
+            });
+
+            buildPresetOptions();
+
+            controlWrap.append(select, addBtn, removeBtn);
+            wrap.append(span, controlWrap);
+            return [wrap, select, addBtn, removeBtn];
+        }
+
+        function mkMovieRules(label) {
+            const title = document.createElement('div');
+            title.textContent = label;
+            title.style.fontWeight = 'bold';
+
+            const wrap = document.createElement('div');
+            Object.assign(wrap.style, {
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                marginTop: '6px'
+            });
+
+            const rows = [];
+
+            const addRow = (rule = {}) => {
+                const row = document.createElement('div');
+                Object.assign(row.style, {
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 1fr 90px 90px 60px',
+                    gap: '6px',
+                    alignItems: 'center'
+                });
+
+                const showInput = document.createElement('input');
+                showInput.type = 'text';
+                showInput.placeholder = 'Show';
+                showInput.value = rule.show || '';
+                styleField(showInput);
+
+                const titleInput = document.createElement('input');
+                titleInput.type = 'text';
+                titleInput.placeholder = 'Movie';
+                titleInput.value = rule.title || '';
+                styleField(titleInput);
+
+                const afterInput = document.createElement('input');
+                afterInput.type = 'number';
+                afterInput.min = '1';
+                afterInput.step = '1';
+                afterInput.placeholder = 'After ep';
+                afterInput.value = rule.afterEpisode || 1;
+                styleField(afterInput);
+
+                const countInput = document.createElement('input');
+                countInput.type = 'number';
+                countInput.min = '1';
+                countInput.step = '1';
+                countInput.placeholder = 'Counts';
+                countInput.value = rule.countsAs || 1;
+                styleField(countInput);
+
+                const removeBtn = document.createElement('button');
+                removeBtn.textContent = 'Remove';
+                styleBtn(removeBtn);
+                removeBtn.style.padding = '3px 8px';
+                removeBtn.addEventListener('click', () => {
+                    wrap.removeChild(row);
+                    const idx = rows.findIndex(item => item.row === row);
+                    if (idx >= 0) rows.splice(idx, 1);
+                });
+
+                row.append(showInput, titleInput, afterInput, countInput, removeBtn);
+                wrap.appendChild(row);
+                rows.push({
+                    row,
+                    show: showInput,
+                    title: titleInput,
+                    afterEpisode: afterInput,
+                    countsAs: countInput
+                });
+            };
+
+            const addBtn = document.createElement('button');
+            addBtn.textContent = 'Add movie rule';
+            styleBtn(addBtn);
+            addBtn.style.padding = '4px 8px';
+            addBtn.addEventListener('click', () => addRow({}));
+
+            const existingRules = Array.isArray(settings.movieRules) ? settings.movieRules : [];
+            if (!existingRules.length) {
+                addRow({});
+            } else {
+                existingRules.forEach(rule => addRow(rule));
+            }
+
+            return [title, wrap, rows, addBtn];
+        }
+
+        function mkPriorityList(label) {
+            const title = document.createElement('div');
+            title.textContent = label;
+            title.style.fontWeight = 'bold';
+
+            const wrap = document.createElement('div');
+            Object.assign(wrap.style, {
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                marginTop: '6px'
+            });
+
+            const rows = [];
+
+            const addRow = (item = {}) => {
+                const row = document.createElement('div');
+                Object.assign(row.style, {
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 90px 60px 60px 60px',
+                    gap: '6px',
+                    alignItems: 'center'
+                });
+
+                const showInput = document.createElement('input');
+                showInput.type = 'text';
+                showInput.placeholder = 'Show';
+                showInput.value = item.show || '';
+                styleField(showInput);
+
+                const nextInput = document.createElement('input');
+                nextInput.type = 'number';
+                nextInput.min = '1';
+                nextInput.step = '1';
+                nextInput.placeholder = 'Next ep';
+                nextInput.value = item.nextEpisode || 1;
+                styleField(nextInput);
+
+                const upBtn = document.createElement('button');
+                upBtn.textContent = 'Up';
+                styleBtn(upBtn);
+                upBtn.style.padding = '3px 8px';
+
+                const downBtn = document.createElement('button');
+                downBtn.textContent = 'Down';
+                styleBtn(downBtn);
+                downBtn.style.padding = '3px 8px';
+
+                const removeBtn = document.createElement('button');
+                removeBtn.textContent = 'Remove';
+                styleBtn(removeBtn);
+                removeBtn.style.padding = '3px 8px';
+
+                upBtn.addEventListener('click', () => {
+                    const idx = rows.findIndex(itemRow => itemRow.row === row);
+                    if (idx > 0) {
+                        wrap.insertBefore(row, rows[idx - 1].row);
+                        const temp = rows[idx - 1];
+                        rows[idx - 1] = rows[idx];
+                        rows[idx] = temp;
+                    }
+                });
+
+                downBtn.addEventListener('click', () => {
+                    const idx = rows.findIndex(itemRow => itemRow.row === row);
+                    if (idx >= 0 && idx < rows.length - 1) {
+                        wrap.insertBefore(rows[idx + 1].row, row);
+                        const temp = rows[idx + 1];
+                        rows[idx + 1] = rows[idx];
+                        rows[idx] = temp;
+                    }
+                });
+
+                removeBtn.addEventListener('click', () => {
+                    wrap.removeChild(row);
+                    const idx = rows.findIndex(itemRow => itemRow.row === row);
+                    if (idx >= 0) rows.splice(idx, 1);
+                });
+
+                row.append(showInput, nextInput, upBtn, downBtn, removeBtn);
+                wrap.appendChild(row);
+                rows.push({
+                    row,
+                    show: showInput,
+                    nextEpisode: nextInput
+                });
+            };
+
+            const addBtn = document.createElement('button');
+            addBtn.textContent = 'Add show';
+            styleBtn(addBtn);
+            addBtn.style.padding = '4px 8px';
+            addBtn.addEventListener('click', () => addRow({}));
+
+            const existing = Array.isArray(settings.showPriority) ? settings.showPriority : [];
+            if (!existing.length) {
+                addRow({});
+            } else {
+                existing.forEach(item => addRow(item));
+            }
+
+            return [title, wrap, rows, addBtn];
+        }
+
+        function sectionDivider() {
+            const divider = document.createElement('div');
+            Object.assign(divider.style, {
+                height: '1px',
+                background: 'rgba(255,255,255,0.15)',
+                margin: '10px 0'
+            });
+            return divider;
+        }
+
+        function sectionTitle(text) {
+            const heading = document.createElement('div');
+            heading.textContent = text;
+            Object.assign(heading.style, {
+                fontWeight: 'bold',
+                marginTop: '6px'
+            });
+            return heading;
+        }
     }
 
     function updateAvgLabel() {
@@ -828,10 +1261,72 @@
         swAvg.textContent = `Avg/${windowSize}: ${text}`;
     }
 
+    function buildPlannerItems(units) {
+        const limit = Math.max(1, Math.floor(units || settings.plannerPreviewUnits || 1));
+        const priorities = Array.isArray(settings.showPriority) ? settings.showPriority : [];
+        const priorityList = priorities
+            .map(item => ({
+                show: (item.show || '').trim(),
+                nextEpisode: Math.max(1, Math.round(Number(item.nextEpisode) || 1))
+            }))
+            .filter(item => item.show);
+
+        if (!priorityList.length) return [];
+
+        const rulesByShow = new Map();
+        (Array.isArray(settings.movieRules) ? settings.movieRules : []).forEach(rule => {
+            const show = (rule.show || '').trim();
+            if (!show) return;
+            const list = rulesByShow.get(show) || [];
+            list.push({
+                title: (rule.title || '').trim(),
+                afterEpisode: Math.max(1, Math.round(Number(rule.afterEpisode) || 1)),
+                countsAs: Math.max(1, Math.round(Number(rule.countsAs) || 1))
+            });
+            rulesByShow.set(show, list);
+        });
+        rulesByShow.forEach(list => list.sort((a, b) => a.afterEpisode - b.afterEpisode));
+
+        const ruleIndexByShow = new Map();
+        const planned = [];
+        let remaining = limit;
+        let cursor = 0;
+        let guard = 0;
+        while (remaining > 0 && guard < limit * 10) {
+            guard += 1;
+            const entry = priorityList[cursor % priorityList.length];
+            cursor += 1;
+
+            const show = entry.show;
+            const nextEp = entry.nextEpisode;
+            const rules = rulesByShow.get(show) || [];
+            const idx = ruleIndexByShow.get(show) || 0;
+            const nextRule = rules[idx];
+
+            if (nextRule && nextRule.title && nextEp === nextRule.afterEpisode + 1) {
+                planned.push({
+                    label: `${show} • Movie: ${nextRule.title}`,
+                    units: nextRule.countsAs
+                });
+                remaining -= nextRule.countsAs;
+                ruleIndexByShow.set(show, idx + 1);
+            } else {
+                planned.push({
+                    label: `${show} Ep ${nextEp}`,
+                    units: 1
+                });
+                entry.nextEpisode += 1;
+                remaining -= 1;
+            }
+        }
+
+        return planned.slice(0, limit);
+    }
+
     // ----- UI refresh -----
     function secondsLeftToGoal(watchedWhole, currentPercent) {
         const projected = watchedWhole + currentPercent / 100;
-        const remainingEpisodes = Math.max(0, EPISODES_PER_DAY - projected);
+        const remainingEpisodes = Math.max(0, settings.episodesPerDay - projected);
         const secPerEpisode = avgSecondsPerEpisode(settings.showLabel);
         return Math.ceil(remainingEpisodes * secPerEpisode);
     }
@@ -840,7 +1335,7 @@
         const today = getTodayLocal();
         const watched = markedEpisodes[today] || 0;
         const projected = watched + currentEpisodePercent / 100;
-        const percent = Math.min(100, (projected / EPISODES_PER_DAY) * 100);
+        const percent = Math.min(100, (projected / settings.episodesPerDay) * 100);
 
         const secsLeft = secondsLeftToGoal(watched, currentEpisodePercent);
         const timeLabel = secsLeft <= 0 ? 'done 🎉' : `${fmtHMSsec(secsLeft)} left`;
@@ -855,6 +1350,21 @@
         updateAvgLabel();
         refreshDayBoxesIfNeeded();
         applyVisibility();
+
+        const planned = buildPlannerItems(settings.plannerPreviewUnits || settings.episodesPerDay);
+        plannerList.innerHTML = '';
+        if (!planned.length) {
+            const empty = document.createElement('div');
+            empty.textContent = 'No planner items yet.';
+            empty.style.opacity = '0.7';
+            plannerList.appendChild(empty);
+        } else {
+            planned.forEach((item, idx) => {
+                const row = document.createElement('div');
+                row.textContent = `${idx + 1}. ${item.label}${item.units > 1 ? ` (${item.units}u)` : ''}`;
+                plannerList.appendChild(row);
+            });
+        }
     }
 
     // Progress loop
