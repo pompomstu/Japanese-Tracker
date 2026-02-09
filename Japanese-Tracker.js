@@ -592,8 +592,10 @@
             fontFamily: 'Arial, sans-serif',
             zIndex: 10000,
             width: '380px',
+            pointerEvents: 'auto',
             boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
         });
+        menu.addEventListener('mousedown', e => e.stopPropagation());
 
         const title = document.createElement('div');
         title.textContent = 'Settings';
@@ -788,14 +790,20 @@
 
         menu.append(
             title,
+            sectionTitle('HUD & Colors'),
             opacityRow,
             epColorRow,
             dayColorRow,
+            sectionDivider(),
+            sectionTitle('Stopwatch'),
             epLenRow,
             labelRow,
             rollRow,
+            sectionDivider(),
+            sectionTitle('Daily Goal Layout'),
             episodesRow,
             columnsRow,
+            sectionDivider(),
             editsTitle,
             editsWrap,
             buttons
@@ -868,6 +876,26 @@
             });
             wrap.append(span, input);
             return [wrap, input];
+        }
+
+        function sectionDivider() {
+            const divider = document.createElement('div');
+            Object.assign(divider.style, {
+                height: '1px',
+                background: 'rgba(255,255,255,0.15)',
+                margin: '10px 0'
+            });
+            return divider;
+        }
+
+        function sectionTitle(text) {
+            const heading = document.createElement('div');
+            heading.textContent = text;
+            Object.assign(heading.style, {
+                fontWeight: 'bold',
+                marginTop: '6px'
+            });
+            return heading;
         }
     }
 
