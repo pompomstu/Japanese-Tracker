@@ -1,355 +1,873 @@
 // ==UserScript==
-// @name         Japanese‑Tracker (extended‑fixed)
+// @name         Japanese-Tracker Lite
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  Track Netflix episodes + Manga chapters, SRS, Speaking & Skip – draggable HUD, charts, full calendar with month/year navigation & editable day‑popup. Skip toggle & calendar color coding.
+// @version      3.8
+// @description  Daily % + time-to-goal; stopwatch fully hidden when minimized; stopwatch moved to bottom; fixed rolling save to keep last 5; bugfixes & minor perf tweaks
 // @match        *://www.netflix.com/watch/*
 // @grant        none
-// @require      https://cdn.jsdelivr.net/npm/chart.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    /* ---------------- USER‑TWEAKABLE CONSTANTS ---------------- */
-    const EPISODES_PER_DAY = 12;   // Anime goal
-    const CHAPTERS_PER_DAY = 5;    // Manga chapters/day
-    const HUD_KEEPALIVE_MS = 2500; // how often to make sure the HUD is still in the DOM
-    /* ---------------------------------------------------------- */
-
-    /* ---------------- SIMPLE LOCAL‑STORAGE WRAPPERS ----------- */
+    // ---------- Config ----------
+    const EPISODES_PER_DAY = 12;
+    const ROLLING_DEFAULT = 5;  // minimum enforced
     const KEYS = {
-        SETTINGS : 'netflixAnimeSettings',          // colours, opacity
-        MARKED   : 'netflixAnimeEpisodesWatched',   // 0–12 per date
-        POSITION : 'netflixHudPosition',            // {left,top} or null
-        READING  : 'jpReadingChapters',             // integer chapters per date
-        TASKS    : 'jpDailyFlags'                   // {srs:boolean,speak:boolean,skip:boolean} per date
+        SETTINGS:   'netflixAnimeSettings',
+        MARKED:     'netflixAnimeEpisodesWatched',
+        POSITION:   'netflixHudPosition',
+        COLLAPSED:  'netflixHudCollapsed',
+        DURATIONS:  'netflixEpisodeDurationsByLabel', // { [label]: Array<{s:number, ts:number}> }
+        SW_MIN:     'netflixStopwatchMinimized'
     };
-    const load = (k,f={}) => JSON.parse(localStorage.getItem(k) || JSON.stringify(f));
-    const save = (k,v)   => localStorage.setItem(k,JSON.stringify(v));
 
-    const todayKey = ()=>{const d=new Date();d.setHours(0,0,0,0);return d.toISOString().split('T')[0];};
-    const dateKey  = d   =>{d.setHours(0,0,0,0);return d.toISOString().split('T')[0];};
+    // ---------- Storage helpers ----------
+    const load = (k, fb = {}) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
+    const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
 
-    /* ---------- settings with default fall‑backs ---------- */
-    let settings = load(KEYS.SETTINGS,{ opacity:0.7, episodeColor:'#0f0', dailyColor:'#0f0' });
+    // ---------- Helpers ----------
+    const getTodayLocal = () => {
+        const now = new Date();
+        now.setHours(0, 0, 0, 0);
+        return now.toISOString().split('T')[0];
+    };
 
-    /* ---------- data buckets ---------- */
-    let markedEpisodes  = load(KEYS.MARKED   ,{});
-    let readingChapters = load(KEYS.READING  ,{});
-    let dailyFlags      = load(KEYS.TASKS    ,{});
+    function normalizeDurations(obj) {
+        const out = {};
+        for (const [label, arr] of Object.entries(obj)) {
+            out[label] = (arr || []).map(it => {
+                if (typeof it === 'number') return { s: Math.max(1, Math.floor(it)), ts: Date.now() };
+                const s = Math.max(1, Math.floor(Number(it?.s) || 0));
+                const ts = Number(it?.ts) || Date.now();
+                return { s, ts };
+            }).filter(x => x.s > 0);
+        }
+        return out;
+    }
 
-    /* ===================================================================
-       MAIN HUD PANEL (draggable) + INTERNAL TOGGLE BUTTON
-       =================================================================== */
-    const MAX_Z = 2147483647;
+    function fmtHMSsec(totalSeconds) {
+        const t = Math.max(0, Math.floor(totalSeconds));
+        const h = Math.floor(t / 3600).toString().padStart(2, '0');
+        const m = Math.floor((t % 3600) / 60).toString().padStart(2, '0');
+        const s = (t % 60).toString().padStart(2, '0');
+        return `${h}:${m}:${s}`;
+    }
 
-    const hud=document.createElement('div');
-    Object.assign(hud.style,{position:'fixed',background:`rgba(0,0,0,${settings.opacity})`,color:'#fff',padding:'12px',borderRadius:'10px',
-        zIndex:MAX_Z,fontFamily:'Arial',fontSize:'14px',display:'flex',flexDirection:'column',alignItems:'center',
-        minWidth:'190px',boxSizing:'border-box',cursor:'move'});
+    function clamp(v, min, max, fallback) {
+        const x = Number.isFinite(v) ? v : fallback;
+        return Math.max(min, Math.min(max, x));
+    }
 
-    const safePlace=()=>{hud.style.bottom='60px';hud.style.right='20px';hud.style.left='auto';hud.style.top='auto';};
-    const pos=load(KEYS.POSITION,null);
-    if(pos){hud.style.left=pos.left;hud.style.top=pos.top;hud.style.right='auto';hud.style.bottom='auto';
-        const x=parseInt(pos.left||0), y=parseInt(pos.top||0);
-        if(x<-50||y<-50||x>innerWidth-50||y>innerHeight-50){ safePlace(); save(KEYS.POSITION,null); }}
-    else safePlace();
+    function parseHms(str) {
+        if (!str) return null;
+        const t = String(str).trim();
+        if (/^\d+$/.test(t)) return Math.max(0, parseInt(t, 10));
+        const parts = t.split(':').map(p => p.trim());
+        if (parts.some(p => p === '' || isNaN(p))) return null;
+        let h = 0, m = 0, s = 0;
+        if (parts.length === 3) [h, m, s] = parts.map(Number);
+        else if (parts.length === 2) { [m, s] = parts.map(Number); }
+        else return null;
+        if (m < 0 || m > 59 || s < 0 || s > 59 || h < 0) return null;
+        return h * 3600 + m * 60 + s;
+    }
 
-    document.body.appendChild(hud);
+    // ---------- State ----------
+    let settings = load(KEYS.SETTINGS, {
+        opacity: 0.7,
+        episodeColor: '#0f0',
+        dailyColor:   '#0f0',
+        episodeMinutes: 25,
+        showLabel: 'default',
+        rollingWindow: ROLLING_DEFAULT
+    });
+    // Enforce minimum rolling window of 5 on load
+    settings.rollingWindow = Math.max(ROLLING_DEFAULT, Math.round(settings.rollingWindow || ROLLING_DEFAULT));
+    save(KEYS.SETTINGS, settings);
 
-    // drag to move
-    let dragging=false, dx=0, dy=0;
-    hud.addEventListener('mousedown',e=>{if(e.target!==hud&&e.target.closest('button'))return; dragging=true; dx=e.offsetX; dy=e.offsetY;});
-    window.addEventListener('mouseup',()=>{dragging=false; save(KEYS.POSITION,{left:hud.style.left,top:hud.style.top});});
-    window.addEventListener('mousemove',e=>{if(dragging){ hud.style.left=`${e.clientX-dx}px`; hud.style.top=`${e.clientY-dy}px`; hud.style.right='auto'; hud.style.bottom='auto'; }});
+    let durationsByLabel = normalizeDurations(load(KEYS.DURATIONS, {}));
+    let markedEpisodes   = load(KEYS.MARKED, {});
+    let position         = load(KEYS.POSITION, null);
+    let isCollapsed      = !!load(KEYS.COLLAPSED, false);
+    let swMinimized      = !!load(KEYS.SW_MIN, false);
+    let currentEpisodePercent = 0;
 
-    const hideBtn=document.createElement('div'); hideBtn.textContent='⏷';
-    Object.assign(hideBtn.style,{position:'absolute',top:'4px',left:'4px',width:'20px',height:'20px',display:'flex',alignItems:'center',justifyContent:'center',
-        background:'#444',borderRadius:'4px',cursor:'pointer',userSelect:'none'});
-    hud.appendChild(hideBtn);
+    const MIN_WIN = () => Math.max(ROLLING_DEFAULT, Math.round(settings.rollingWindow || ROLLING_DEFAULT));
 
-    const bodyWrap=document.createElement('div'); bodyWrap.style.marginTop='6px'; hud.appendChild(bodyWrap);
-    hideBtn.onclick=()=>{ const hidden=bodyWrap.style.display==='none'; bodyWrap.style.display=hidden?'block':'none'; hideBtn.textContent=hidden?'⏷':'⏵'; };
+    function getDurations(label) {
+        return (durationsByLabel[label] || []).slice().sort((a, b) => a.ts - b.ts);
+    }
+    function setDurations(label, arr) {
+        durationsByLabel[label] = arr;
+        save(KEYS.DURATIONS, durationsByLabel);
+    }
+    function pushDuration(label, seconds) {
+        const arr = getDurations(label);
+        arr.push({ s: Math.max(1, Math.floor(seconds)), ts: Date.now() });
+        const limit = MIN_WIN();
+        while (arr.length > limit) arr.shift(); // keep last N
+        setDurations(label, arr);
+    }
+    function avgSecondsPerEpisode(label) {
+        const arr = getDurations(label);
+        if (!arr.length) return Math.max(1, settings.episodeMinutes) * 60;
+        const sum = arr.reduce((a, b) => a + b.s, 0);
+        return Math.max(1, Math.round(sum / arr.length));
+    }
+    function recent5(label) {
+        return getDurations(label).slice(-5);
+    }
 
-    /* ===================================================================
-                          UI HELPERS
-       =================================================================== */
-    const makeRow=(n,filled,onClick,color='#0f0',w=12,h=12)=>{
-        const row=document.createElement('div'); row.style.display='flex'; row.style.gap='4px';
-        for(let i=0;i<n;i++){
-            const box=document.createElement('div');
-            Object.assign(box.style,{width:`${w}px`,height:`${h}px`,border:'1px solid #fff',borderRadius:'2px',background:i<filled?color:'transparent',cursor:onClick?'pointer':'default'});
-            if(onClick) box.onclick=()=>onClick(i);
+    // ---------- UI Root ----------
+    const overlay = document.createElement('div');
+    Object.assign(overlay.style, {
+        position: 'fixed',
+        background: `rgba(0,0,0,${settings.opacity})`,
+        color: 'white',
+        borderRadius: '10px',
+        zIndex: 9999,
+        fontFamily: 'Arial, sans-serif',
+        fontSize: '14px',
+        minWidth: '200px',
+        userSelect: 'none',
+        boxShadow: '0 4px 16px rgba(0,0,0,0.4)'
+    });
+    if (position) {
+        overlay.style.left = position.left;
+        overlay.style.top  = position.top;
+        overlay.style.right = 'auto';
+        overlay.style.bottom = 'auto';
+    } else {
+        overlay.style.right = '20px';
+        overlay.style.bottom = '60px';
+    }
+
+    // Header (drag + gear)
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        padding: '6px 8px',
+        cursor: 'move'
+    });
+    const title = document.createElement('div');
+    title.textContent = 'Tracker';
+    Object.assign(title.style, {
+        flex: '1',
+        fontWeight: 'bold',
+        cursor: 'inherit'
+    });
+
+    const gearBtn = document.createElement('button');
+    gearBtn.textContent = '⚙';
+    Object.assign(gearBtn.style, {
+        cursor: 'pointer',
+        background: 'transparent',
+        color: 'white',
+        border: 'none',
+        fontSize: '12px',
+        lineHeight: '1',
+        padding: '2px',
+        width: '18px',
+        height: '18px',
+        display: 'grid',
+        placeItems: 'center',
+        opacity: 0.9
+    });
+    gearBtn.addEventListener('mousedown', e => e.stopPropagation());
+    header.append(title, gearBtn);
+    overlay.appendChild(header);
+
+    const content = document.createElement('div');
+    Object.assign(content.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        padding: '0 10px 10px 10px',
+        cursor: 'default'
+    });
+    overlay.appendChild(content);
+
+    // ---------- Small UI helpers ----------
+    function styleBtn(b) {
+        Object.assign(b.style, {
+            background: '#333',
+            color: 'white',
+            border: '1px solid #666',
+            borderRadius: '6px',
+            padding: '4px 8px',
+            cursor: 'pointer',
+            fontSize: '12px'
+        });
+    }
+
+    function createBoxRow(count, filled, onClick, color = '#0f0') {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '4px';
+        for (let i = 0; i < count; i++) {
+            const box = document.createElement('div');
+            Object.assign(box.style, {
+                width: '12px',
+                height: '12px',
+                border: '1px solid white',
+                borderRadius: '2px',
+                backgroundColor: i < filled ? color : 'transparent',
+                cursor: onClick ? 'pointer' : 'default'
+            });
+            if (onClick) box.addEventListener('click', () => onClick(i));
             row.appendChild(box);
         }
         return row;
-    };
-    const addSection=title=>{ const head=document.createElement('div'); head.textContent=title;
-        Object.assign(head.style,{fontWeight:'bold',cursor:'pointer',marginTop:'6px'});
-        const body=document.createElement('div'); bodyWrap.append(head,body);
-        head.onclick=()=>{ body.style.display = body.style.display==='none'?'block':'none'; };
-        return body;
-    };
+    }
 
-    /* ===================================================================
-                             SECTIONS
-       =================================================================== */
+    function buildDayBoxContainer() {
+        const container = document.createElement('div');
+        container.style.display = 'flex';
+        container.style.flexDirection = 'column';
+        container.style.gap = '4px';
 
-    /* (1) Anime section ------------------------------------------------- */
-    const epSec=addSection('🎬 Anime');
-    const playPercent=document.createElement('div'); epSec.appendChild(playPercent);
-    const epBar=makeRow(10,0,null,'#2196f3',18,6); epBar.style.marginTop='2px'; epSec.appendChild(epBar);
-    const epCountTxt=document.createElement('div'); epCountTxt.style.marginTop='6px'; epSec.appendChild(epCountTxt);
-
-    function renderEpGrid(){
-        const old=epSec.querySelector('.ep‑grid'); if(old) old.remove();
-        const g=document.createElement('div'); g.className='ep‑grid'; g.style.display='flex'; g.style.flexDirection='column'; g.style.gap='4px';
-        for(let r=0;r<2;r++){
-            const row=document.createElement('div'); row.style.display='flex'; row.style.gap='8px';
-            for(let p=0;p<3;p++){
-                const start=r*6+p*2;
-                const filled=Math.max(0,Math.min(2,(markedEpisodes[todayKey()]||0)-start));
-                const pair=makeRow(2,filled,i=>{
-                    const idx=start+i; const cur=markedEpisodes[todayKey()]||0;
-                    markedEpisodes[todayKey()] = idx<cur ? cur-1 : cur+1;
-                    save(KEYS.MARKED,markedEpisodes); refreshHUD();
-                },settings.dailyColor);
-                row.appendChild(pair);
+        for (let row = 0; row < 2; row++) {
+            const rowContainer = document.createElement('div');
+            rowContainer.style.display = 'flex';
+            rowContainer.style.gap = '8px';
+            for (let pair = 0; pair < 3; pair++) {
+                const startIndex = row * 6 + pair * 2;
+                const todayKey = getTodayLocal();
+                const filledCount = Math.max(
+                    0,
+                    Math.min(2, (markedEpisodes[todayKey] || 0) - startIndex)
+                );
+                const boxPair = createBoxRow(2, filledCount, i => {
+                    const clickedIndex = startIndex + i;
+                    const count = markedEpisodes[todayKey] || 0;
+                    markedEpisodes[todayKey] = clickedIndex < count ? count - 1 : count + 1;
+                    markedEpisodes[todayKey] = Math.max(0, Math.min(EPISODES_PER_DAY, markedEpisodes[todayKey]));
+                    save(KEYS.MARKED, markedEpisodes);
+                    updateUI();
+                }, settings.dailyColor);
+                rowContainer.appendChild(boxPair);
             }
-            g.appendChild(row);
+            container.appendChild(rowContainer);
         }
-        epSec.appendChild(g);
+        return container;
     }
 
-    /* (2) Reading progress -------------------------------------------- */
-    const readSec=addSection('📚 Reading (Chapters)');
-    const readBar=document.createElement('div'); readBar.style.display='flex'; readSec.appendChild(readBar);
+    // ===== DAILY ROW =====
+    const dailyRow = document.createElement('div');
+    Object.assign(dailyRow.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px'
+    });
 
-    function renderReadBar(){
-        const ch=readingChapters[todayKey()]||0;
-        const filled=Math.min(CHAPTERS_PER_DAY,ch);
-        readBar.innerHTML='';
-        // toggle on click: filled->-1, else +1
-        const row = makeRow(CHAPTERS_PER_DAY, filled, i=>{
-            const cur=readingChapters[todayKey()]||0;
-            readingChapters[todayKey()] = i<cur ? cur-1 : cur+1;
-            save(KEYS.READING,readingChapters); refreshHUD();
-        },'#4caf50',24,24);
-        readBar.appendChild(row);
-    }
+    const dailyLine = document.createElement('div'); // "Daily: XX.X% • hh:mm:ss"
+    dailyLine.style.fontVariantNumeric = 'tabular-nums';
+    dailyLine.style.flex = '1';
 
-    /* (3) Daily flags --------------------------------------------------- */
-    const flagSec=addSection('🗓 Daily Tasks');
-    function makeFlagBtn(label,flag){
-        const b=document.createElement('button'); b.textContent=label;
-        Object.assign(b.style,{margin:'2px 4px',background:'#333',color:'#fff',border:'1px solid #888',borderRadius:'6px',cursor:'pointer'});
-        b.onclick=()=>{
-            const k=todayKey();
-            const d=dailyFlags[k]||{srs:false,speak:false,skip:false};
-            d[flag] = !d[flag];
-            dailyFlags[k] = d;
-            save(KEYS.TASKS,dailyFlags);
-            refreshHUD();
-        };
-        flagSec.appendChild(b);
-        return b;
-    }
-    const srsBtn   = makeFlagBtn('✅ SRS','srs');
-    const speakBtn = makeFlagBtn('🗣 Speaking','speak');
-    const skipBtn  = makeFlagBtn('🚫 Skip','skip');
+    // Tiny chip that appears ONLY when stopwatch is minimized (and HUD expanded)
+    const swChip = document.createElement('button');
+    swChip.textContent = '⏱';
+    Object.assign(swChip.style, {
+        display: 'none',
+        cursor: 'pointer',
+        background: 'transparent',
+        color: 'white',
+        border: '1px solid #666',
+        borderRadius: '4px',
+        fontSize: '12px',
+        padding: '0 6px',
+        lineHeight: '18px',
+        height: '20px'
+    });
 
-    /* (4) footer (settings + calendar) --------------------------------- */
-    const footer=document.createElement('div'); footer.style.display='flex'; footer.style.gap='10px'; footer.style.marginTop='10px'; bodyWrap.appendChild(footer);
-    const makeFootBtn=(txt,cb)=>{ const b=document.createElement('button'); b.textContent=txt;
-        Object.assign(b.style,{background:'#333',color:'#fff',border:'1px solid #888',borderRadius:'6px',padding:'4px 8px',cursor:'pointer',fontSize:'16px'});
-        b.onclick=cb; footer.appendChild(b);
-    };
-    makeFootBtn('⚙️',openSettings);
-    makeFootBtn('📅',openCalendar);
+    const collapseBtn = document.createElement('button'); // collapse/expand HUD
+    collapseBtn.textContent = isCollapsed ? '▼' : '▲';
+    Object.assign(collapseBtn.style, {
+        cursor: 'pointer',
+        background: 'transparent',
+        color: 'white',
+        border: '1px solid #666',
+        borderRadius: '4px',
+        fontSize: '12px',
+        padding: '0 6px',
+        lineHeight: '18px',
+        height: '20px'
+    });
+    [swChip, collapseBtn].forEach(btn =>
+        btn.addEventListener('mousedown', e => e.stopPropagation())
+    );
 
-    /* ===================================================================
-                             SETTINGS POPUP
-       =================================================================== */
-    function styliseInput(input){ Object.assign(input.style,{background:'#222',color:'#fff',border:'1px solid #555',borderRadius:'4px',padding:'2px 4px',boxSizing:'border-box'}); }
+    dailyRow.append(dailyLine, swChip, collapseBtn);
+    content.appendChild(dailyRow);
 
-    function openSettings(){
-        const pop=document.createElement('div');
-        Object.assign(pop.style,{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',background:'#111',color:'#fff',padding:'20px',borderRadius:'10px',zIndex:MAX_Z,fontFamily:'Arial'});
-        const mkRow=(lbl,input)=>{ const l=document.createElement('label'); l.textContent=lbl; l.style.display='block'; l.style.margin='8px 0'; l.appendChild(input); return l; };
+    // ===== COLLAPSIBLE BLOCK (everything except daily row) =====
+    const collapsibleBlock = document.createElement('div');
+    Object.assign(collapsibleBlock.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px'
+    });
+    content.appendChild(collapsibleBlock);
 
-        const op=document.createElement('input'); Object.assign(op,{type:'number',step:'0.1',min:0,max:1,value:settings.opacity}); styliseInput(op);
-        const col=document.createElement('input'); col.type='color'; col.value=settings.episodeColor;
+    // Current episode progress (text + bar)
+    const episodeText = document.createElement('div');
+    episodeText.style.fontVariantNumeric = 'tabular-nums';
+    const episodeBar = createBoxRow(10, 0, null, settings.episodeColor);
+    collapsibleBlock.append(episodeText, episodeBar);
 
-        pop.appendChild(mkRow('Panel opacity',op));
-        pop.appendChild(mkRow('Episode‑grid colour',col));
+    // Day boxes (with lazy refresh)
+    let dayBoxContainer = buildDayBoxContainer();
+    let lastDayBoxKey = getTodayLocal();
+    let lastMarkedCount = markedEpisodes[lastDayBoxKey] || 0;
+    collapsibleBlock.appendChild(dayBoxContainer);
 
-        const saveBtn=document.createElement('button'); saveBtn.textContent='Save'; saveBtn.style.marginTop='10px'; saveBtn.onclick=()=>{
-            settings.opacity = parseFloat(op.value) || settings.opacity;
-            settings.episodeColor = col.value || settings.episodeColor;
-            save(KEYS.SETTINGS,settings);
-            hud.style.background=`rgba(0,0,0,${settings.opacity})`;
-            pop.remove(); refreshHUD();
-        };
-        pop.appendChild(saveBtn);
+    function refreshDayBoxesIfNeeded() {
+        const todayKey = getTodayLocal();
+        const count = markedEpisodes[todayKey] || 0;
+        if (dayBoxContainer && todayKey === lastDayBoxKey && count === lastMarkedCount) return;
 
-        const closeBtn=document.createElement('button'); closeBtn.textContent='Close'; closeBtn.style.marginLeft='8px'; closeBtn.onclick=()=>pop.remove();
-        pop.appendChild(closeBtn);
-        document.body.appendChild(pop);
-    }
+        lastDayBoxKey = todayKey;
+        lastMarkedCount = count;
 
-    /* ===================================================================
-                                CALENDAR / CHART
-       =================================================================== */
-    function openCalendar(){
-        const overlay=document.createElement('div');
-        Object.assign(overlay.style,{position:'fixed',top:'0',left:'0',width:'100%',height:'100%',background:'rgba(0,0,0,0.8)',zIndex:MAX_Z,overflowY:'auto'});
-        overlay.onclick=e=>{ if(e.target===overlay) overlay.remove(); };
-
-        const container=document.createElement('div'); container.style.width='100%'; container.style.maxWidth='720px'; container.style.margin='60px auto'; container.style.color='#fff'; overlay.appendChild(container);
-        const canvas=document.createElement('canvas'); canvas.width=680; canvas.height=360; container.appendChild(canvas);
-
-        const labels=[], epData=[], readData=[], srsData=[], speakData=[];
-        for(let i=29;i>=0;i--){ const d=new Date(); d.setDate(d.getDate()-i); const k=dateKey(d);
-            labels.push(k.slice(5)); epData.push(markedEpisodes[k]||0); readData.push(readingChapters[k]||0);
-            const f=dailyFlags[k]||{}; srsData.push(f.srs?1:0); speakData.push(f.speak?1:0);
+        if (dayBoxContainer && dayBoxContainer.parentNode === collapsibleBlock) {
+            collapsibleBlock.removeChild(dayBoxContainer);
         }
-        new Chart(canvas.getContext('2d'),{
-            type:'bar', data:{labels,datasets:[
-                {label:'Episodes',data:epData,yAxisID:'y1',backgroundColor:'#4caf50'},
-                {label:'Chapters',data:readData,yAxisID:'y1',backgroundColor:'#2196f3'},
-                {label:'SRS ✔',data:srsData,yAxisID:'y2',type:'line',borderWidth:2,fill:false,borderColor:'#ffeb3b'},
-                {label:'Speak ✔',data:speakData,yAxisID:'y2',type:'line',borderWidth:2,fill:false,borderColor:'#ff5722'}
-            ]},
-            options:{plugins:{legend:{labels:{color:'#fff'}}}, scales:{x:{ticks:{color:'#fff'}}, y1:{beginAtZero:true,ticks:{color:'#fff'}}, y2:{beginAtZero:true,max:1,position:'right',grid:{display:false},ticks:{stepSize:1,color:'#fff'}}}
-        }});
-
-        const navWrapper=document.createElement('div');
-        Object.assign(navWrapper.style,{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:'30px',gap:'10px'});
-        container.appendChild(navWrapper);
-
-        const navBtnStyle={background:'#333',color:'#fff',border:'1px solid #888',borderRadius:'4px',cursor:'pointer',padding:'2px 6px',fontSize:'14px'};
-        const prevYearBtn=document.createElement('button'); prevYearBtn.textContent='«'; Object.assign(prevYearBtn.style,navBtnStyle);
-        const prevMonthBtn=document.createElement('button'); prevMonthBtn.textContent='‹'; Object.assign(prevMonthBtn.style,navBtnStyle);
-        const nextMonthBtn=document.createElement('button'); nextMonthBtn.textContent='›'; Object.assign(nextMonthBtn.style,navBtnStyle);
-        const nextYearBtn=document.createElement('button'); nextYearBtn.textContent='»'; Object.assign(nextYearBtn.style,navBtnStyle);
-        const monthLabel=document.createElement('div'); monthLabel.style.flex='1'; monthLabel.style.textAlign='center'; monthLabel.style.fontWeight='bold';
-        navWrapper.append(prevYearBtn,prevMonthBtn,monthLabel,nextMonthBtn,nextYearBtn);
-
-        const calDiv=document.createElement('div'); calDiv.style.marginTop='10px'; container.appendChild(calDiv);
-        let viewDate=new Date();
-        const renderCalendar=()=>{ monthLabel.textContent=`${viewDate.toLocaleString('default',{month:'long'})} ${viewDate.getFullYear()}`; buildCalendar(calDiv,viewDate); };
-        prevYearBtn.onclick=()=>{ viewDate.setFullYear(viewDate.getFullYear()-1); renderCalendar(); };
-        nextYearBtn.onclick=()=>{ viewDate.setFullYear(viewDate.getFullYear()+1); renderCalendar(); };
-        prevMonthBtn.onclick=()=>{ viewDate.setMonth(viewDate.getMonth()-1); renderCalendar(); };
-        nextMonthBtn.onclick=()=>{ viewDate.setMonth(viewDate.getMonth()+1); renderCalendar(); };
-        renderCalendar();
-        document.body.appendChild(overlay);
+        dayBoxContainer = buildDayBoxContainer();
+        collapsibleBlock.appendChild(dayBoxContainer);
     }
 
-    /* ---------- buildCalendar + day‑edit popup ---------- */
-    function buildCalendar(target,date){
-        target.innerHTML='';
-        const tbl=document.createElement('table'); tbl.style.width='100%'; tbl.style.borderCollapse='collapse'; tbl.style.textAlign='center';
-        const headerRow=document.createElement('tr'); ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d=>{ const th=document.createElement('th'); th.textContent=d; th.style.padding='4px 0'; tbl.appendChild(th); });
-        tbl.appendChild(headerRow);
+    // ===== STOPWATCH BLOCK (AT VERY BOTTOM) =====
+    const swBlock = document.createElement('div');
+    Object.assign(swBlock.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px'
+    });
 
-        const firstOfMonth=new Date(date.getFullYear(),date.getMonth(),1);
-        const offset=((firstOfMonth.getDay()+6)%7);
-        const daysInMonth=new Date(date.getFullYear(),date.getMonth()+1,0).getDate();
-        let curDay=1-offset;
+    const swHeader = document.createElement('div');
+    Object.assign(swHeader.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        marginTop: '4px'
+    });
 
-        for(let r=0;r<6;r++){
-            const tr=document.createElement('tr');
-            for(let c=0;c<7;c++){
-                const td=document.createElement('td'); td.style.padding='4px'; td.style.cursor='pointer';
-                if(curDay>0 && curDay<=daysInMonth){
-                    const d=new Date(date.getFullYear(),date.getMonth(),curDay);
-                    const k=dateKey(d);
-                    td.textContent=curDay;
-                    td.style.color=(k===todayKey())?'#0ff':'#fff';
-                    const watched = markedEpisodes[k]||0;
-                    const read    = readingChapters[k]||0;
-                    const f       = dailyFlags[k]||{};
-                    td.title = `Ep ${watched}/${EPISODES_PER_DAY}\nCh ${read}/${CHAPTERS_PER_DAY}\nSRS:${f.srs?'✔':'✘'} Speak:${f.speak?'✔':'✘'} Skip:${f.skip?'✔':'✘'}`;
-                    // color code
-                    if(f.skip) {
-                        td.style.backgroundColor = '#2196f3'; // blue
-                    } else if(watched>=EPISODES_PER_DAY && read>=CHAPTERS_PER_DAY && f.srs && f.speak) {
-                        td.style.backgroundColor = '#4caf50'; // green
-                    } else if(watched===0 && read===0 && !f.srs && !f.speak) {
-                        td.style.backgroundColor = '#f44336'; // red
+    const swToggle = document.createElement('button');
+    swToggle.textContent = swMinimized ? '▲' : '▼'; // ▼ open, ▲ minimize
+    Object.assign(swToggle.style, {
+        cursor: 'pointer',
+        background: 'transparent',
+        color: 'white',
+        border: '1px solid #666',
+        borderRadius: '4px',
+        fontSize: '12px',
+        padding: '0 4px',
+        lineHeight: '18px',
+        height: '20px'
+    });
+
+    const swTitle = document.createElement('div');
+    swTitle.textContent = 'Stopwatch';
+    Object.assign(swTitle.style, {
+        fontWeight: 'bold'
+    });
+
+    const swAvg = document.createElement('div');
+    Object.assign(swAvg.style, {
+        marginLeft: 'auto',
+        fontVariantNumeric: 'tabular-nums',
+        opacity: 0.9
+    });
+
+    const swPanel = document.createElement('div');
+    Object.assign(swPanel.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        marginTop: '4px'
+    });
+
+    const swClock = document.createElement('div');
+    swClock.textContent = '⏱ 00:00:00';
+    swClock.style.fontVariantNumeric = 'tabular-nums';
+
+    const swStartPause = document.createElement('button');
+    swStartPause.textContent = 'Start';
+    styleBtn(swStartPause);
+    const swStop = document.createElement('button');
+    swStop.textContent = 'Stop';
+    styleBtn(swStop);
+    const swReset = document.createElement('button');
+    swReset.textContent = 'Reset';
+    styleBtn(swReset);
+
+    swPanel.append(swClock, swStartPause, swStop, swReset);
+    swHeader.append(swToggle, swTitle, swAvg);
+    swBlock.append(swHeader, swPanel);
+    collapsibleBlock.appendChild(swBlock);
+
+    // ---------- Visibility handling ----------
+    function applyVisibility() {
+        // HUD body
+        collapsibleBlock.style.display = isCollapsed ? 'none' : 'flex';
+
+        // Stopwatch header/panel
+        const shouldShowStopwatch = !isCollapsed && !swMinimized;
+        swHeader.style.display = shouldShowStopwatch ? 'flex' : 'none';
+        swPanel.style.display  = shouldShowStopwatch ? 'flex' : 'none';
+
+        // Chip visible only when HUD expanded + stopwatch minimized
+        swChip.style.display = (!isCollapsed && swMinimized) ? '' : 'none';
+
+        collapseBtn.textContent = isCollapsed ? '▼' : '▲';
+        swToggle.textContent    = swMinimized ? '▲' : '▼';
+    }
+
+    function setStopwatchMinimized(min) {
+        swMinimized = !!min;
+        save(KEYS.SW_MIN, swMinimized);
+        applyVisibility();
+    }
+
+    function setCollapsed(next) {
+        isCollapsed = !!next;
+        save(KEYS.COLLAPSED, isCollapsed);
+        applyVisibility();
+    }
+
+    swToggle.onclick = () => setStopwatchMinimized(!swMinimized);
+    swChip.onclick   = () => setStopwatchMinimized(false);
+    collapseBtn.onclick = () => setCollapsed(!isCollapsed);
+
+    // ---------- Stopwatch logic ----------
+    let swRunning = false;
+    let swAccumMs = 0;
+    let swStartTs = 0;
+    let swTimerId = null;
+
+    function fmtHMSms(ms) {
+        return fmtHMSsec(Math.floor(ms / 1000));
+    }
+
+    function swUpdateClock() {
+        const now = Date.now();
+        const elapsed = swAccumMs + (swRunning ? (now - swStartTs) : 0);
+        swClock.textContent = `⏱ ${fmtHMSms(elapsed)}`;
+    }
+
+    function swStart() {
+        if (swRunning) return;
+        swRunning = true;
+        swStartTs = Date.now();
+        swStartPause.textContent = 'Pause';
+        if (swTimerId) clearInterval(swTimerId);
+        swTimerId = setInterval(swUpdateClock, 250);
+    }
+
+    function swPause() {
+        if (!swRunning) return;
+        swRunning = false;
+        swAccumMs += Date.now() - swStartTs;
+        swStartPause.textContent = 'Start';
+        swUpdateClock();
+        if (swTimerId) {
+            clearInterval(swTimerId);
+            swTimerId = null;
+        }
+    }
+
+    function swStopAndRecord() {
+        if (swRunning) {
+            swRunning = false;
+            swAccumMs += Date.now() - swStartTs;
+        }
+        if (swTimerId) {
+            clearInterval(swTimerId);
+            swTimerId = null;
+        }
+        const seconds = Math.floor(swAccumMs / 1000);
+        if (seconds > 0) {
+            pushDuration(settings.showLabel, seconds); // keeps last MIN_WIN() (>=5)
+            updateAvgLabel();
+            swAccumMs = 0;
+            swStartPause.textContent = 'Start';
+            swUpdateClock();
+            updateUI(); // recalc time-to-goal using updated average
+        }
+    }
+
+    function swResetAll() {
+        swRunning = false;
+        swAccumMs = 0;
+        swStartPause.textContent = 'Start';
+        if (swTimerId) {
+            clearInterval(swTimerId);
+            swTimerId = null;
+        }
+        swUpdateClock();
+    }
+
+    swStartPause.onclick = () => (swRunning ? swPause() : swStart());
+    swStop.onclick = swStopAndRecord;
+    swReset.onclick = swResetAll;
+
+    // ---------- Drag behavior ----------
+    let isDraggingHud = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    header.addEventListener('mousedown', e => {
+        isDraggingHud = true;
+        const rect = overlay.getBoundingClientRect();
+        offsetX = e.clientX - rect.left;
+        offsetY = e.clientY - rect.top;
+        e.preventDefault();
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (!isDraggingHud) return;
+        isDraggingHud = false;
+        save(KEYS.POSITION, { left: overlay.style.left, top: overlay.style.top });
+    });
+
+    window.addEventListener('mousemove', e => {
+        if (!isDraggingHud) return;
+        overlay.style.left = `${e.clientX - offsetX}px`;
+        overlay.style.top  = `${e.clientY - offsetY}px`;
+        overlay.style.right = 'auto';
+        overlay.style.bottom = 'auto';
+    });
+
+    // ---------- Settings dialog ----------
+    gearBtn.onclick = () => openSettings();
+
+    function openSettings() {
+        const menu = document.createElement('div');
+        Object.assign(menu.style, {
+            position: 'fixed',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: '#111',
+            padding: '16px',
+            borderRadius: '10px',
+            color: 'white',
+            fontFamily: 'Arial, sans-serif',
+            zIndex: 10000,
+            width: '380px',
+            boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
+        });
+
+        const title = document.createElement('div');
+        title.textContent = 'Settings';
+        Object.assign(title.style, {
+            fontSize: '16px',
+            fontWeight: 'bold',
+            marginBottom: '10px'
+        });
+
+        const [opacityRow, opacityInput] = mkNum('HUD Opacity', settings.opacity, 0, 1, 0.1);
+        const [epColorRow, epColorInput] = mkColor('Episode Box', settings.episodeColor);
+        const [dayColorRow, dayColorInput] = mkColor('Daily Box', settings.dailyColor);
+        const [epLenRow, epLenInput] = mkNum('Fallback ep length (min)', settings.episodeMinutes, 1, 300, 1);
+        const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
+        const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+
+        const editsTitle = document.createElement('div');
+        editsTitle.textContent = `Last 5 durations for "${settings.showLabel}"`;
+        Object.assign(editsTitle.style, {
+            marginTop: '12px',
+            fontWeight: 'bold'
+        });
+
+        const editsWrap = document.createElement('div');
+        Object.assign(editsWrap.style, {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px',
+            marginTop: '6px'
+        });
+
+        const rows = [];
+        const recent = recent5(settings.showLabel);
+        if (!recent.length) {
+            const empty = document.createElement('div');
+            empty.textContent = 'No samples yet.';
+            empty.style.opacity = '0.8';
+            editsWrap.appendChild(empty);
+        } else {
+            recent.forEach((item, idx) => {
+                const row = document.createElement('div');
+                Object.assign(row.style, {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                });
+
+                const lbl = document.createElement('div');
+                lbl.textContent = `#${recent.length - idx}`;
+                lbl.style.width = '32px';
+                lbl.style.textAlign = 'right';
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = fmtHMSsec(item.s);
+                Object.assign(input.style, {
+                    background: '#222',
+                    color: 'white',
+                    border: '1px solid #666',
+                    borderRadius: '4px',
+                    padding: '4px',
+                    width: '100px',
+                    fontVariantNumeric: 'tabular-nums'
+                });
+
+                const del = document.createElement('button');
+                del.textContent = 'Delete';
+                styleBtn(del);
+                del.style.padding = '3px 8px';
+
+                row.append(lbl, input, del);
+                editsWrap.appendChild(row);
+                rows.push({ item, input, del });
+            });
+        }
+
+        const buttons = document.createElement('div');
+        buttons.style.display = 'flex';
+        buttons.style.justifyContent = 'space-between';
+        buttons.style.gap = '8px';
+        buttons.style.marginTop = '12px';
+
+        const left = document.createElement('div');
+        left.style.display = 'flex';
+        left.style.gap = '8px';
+
+        const cancel = document.createElement('button');
+        cancel.textContent = 'Cancel';
+        styleBtn(cancel);
+
+        const saveBtn = document.createElement('button');
+        saveBtn.textContent = 'Save';
+        Object.assign(saveBtn.style, {
+            background: '#4a4',
+            color: 'white',
+            border: '1px solid #3a3',
+            borderRadius: '6px',
+            padding: '6px 12px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+        });
+
+        const applyEditsBtn = document.createElement('button');
+        applyEditsBtn.textContent = 'Save edits';
+        Object.assign(applyEditsBtn.style, {
+            background: '#286090',
+            color: 'white',
+            border: '1px solid #204d74',
+            borderRadius: '6px',
+            padding: '6px 12px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+        });
+
+        left.append(applyEditsBtn, cancel);
+        buttons.append(left, saveBtn);
+
+        cancel.onclick = () => document.body.removeChild(menu);
+
+        saveBtn.onclick = () => {
+            settings.opacity        = clamp(parseFloat(opacityInput.value), 0, 1, 0.7);
+            settings.episodeColor   = epColorInput.value;
+            settings.dailyColor     = dayColorInput.value;
+            settings.episodeMinutes = Math.max(
+                1,
+                Math.min(300, Math.round(parseFloat(epLenInput.value) || settings.episodeMinutes))
+            );
+            settings.showLabel      = (labelInput.value || 'default').trim();
+            // enforce min 5
+            settings.rollingWindow  = Math.max(
+                ROLLING_DEFAULT,
+                Math.min(50, Math.round(parseFloat(rollInput.value) || settings.rollingWindow))
+            );
+
+            save(KEYS.SETTINGS, settings);
+            overlay.style.background = `rgba(0,0,0,${settings.opacity})`;
+            updateAvgLabel();
+            document.body.removeChild(menu);
+            updateUI();
+        };
+
+        applyEditsBtn.onclick = () => {
+            const all = getDurations(settings.showLabel);
+            const last5 = all.slice(-5);
+            rows.forEach(({ item, input, del }) => {
+                const idx = last5.findIndex(x => x.ts === item.ts && x.s === item.s);
+                const deleted = del.dataset._deleted === '1';
+                if (idx >= 0) {
+                    if (deleted) {
+                        last5.splice(idx, 1);
                     } else {
-                        td.style.backgroundColor = '#ffeb3b'; // partial
+                        const parsed = parseHms(input.value);
+                        if (parsed != null && parsed > 0) last5[idx].s = parsed;
                     }
-                    td.style.border = '1px solid #888';
-                    td.style.borderRadius = '4px';
-                    td.onclick = ()=>openDayPopup(d);
-                } else {
-                    td.textContent='';
                 }
-                tr.appendChild(td);
-                curDay++;
-            }
-            tbl.appendChild(tr);
-        }
-        target.appendChild(tbl);
-    }
-
-    function openDayPopup(d){
-        const k=dateKey(d);
-        const pop=document.createElement('div');
-        Object.assign(pop.style,{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',background:'#111',color:'#fff',padding:'20px',borderRadius:'10px',zIndex:MAX_Z,fontFamily:'Arial',minWidth:'220px'});
-        const mkField=(lbl,input)=>{ const w=document.createElement('div'); w.style.margin='8px 0'; const l=document.createElement('span'); l.textContent=lbl; l.style.marginRight='8px'; w.append(l,input); return w; };
-
-        const epInput   = document.createElement('input'); Object.assign(epInput,{type:'number',min:0,max:EPISODES_PER_DAY,value:markedEpisodes[k]||0}); styliseInput(epInput);
-        const chInput   = document.createElement('input'); Object.assign(chInput,{type:'number',min:0,max:CHAPTERS_PER_DAY,value:readingChapters[k]||0}); styliseInput(chInput);
-        const srsChk    = document.createElement('input'); srsChk.type='checkbox'; srsChk.checked=(dailyFlags[k]||{}).srs||false;
-        const speakChk  = document.createElement('input'); speakChk.type='checkbox'; speakChk.checked=(dailyFlags[k]||{}).speak||false;
-        const skipChk   = document.createElement('input'); skipChk.type='checkbox'; skipChk.checked=(dailyFlags[k]||{}).skip||false;
-
-        pop.appendChild(mkField('Episodes',epInput));
-        pop.appendChild(mkField('Chapters',chInput));
-        pop.appendChild(mkField('SRS ✔',srsChk));
-        pop.appendChild(mkField('Speak ✔',speakChk));
-        pop.appendChild(mkField('Skip 🚫',skipChk));
-
-        const saveBtn=document.createElement('button'); saveBtn.textContent='Save'; saveBtn.onclick=()=>{
-            markedEpisodes[k]  = parseInt(epInput.value)||0;
-            readingChapters[k] = parseInt(chInput.value)||0;
-            dailyFlags[k]      = { srs: srsChk.checked, speak: speakChk.checked, skip: skipChk.checked };
-            save(KEYS.MARKED, markedEpisodes);
-            save(KEYS.READING, readingChapters);
-            save(KEYS.TASKS,   dailyFlags);
-            pop.remove(); refreshHUD();
+            });
+            const older = all.slice(0, Math.max(0, all.length - 5));
+            setDurations(settings.showLabel, older.concat(last5));
+            updateAvgLabel();
+            updateUI();
+            document.body.removeChild(menu);
+            openSettings(); // reopen refreshed
         };
-        const closeBtn=document.createElement('button'); closeBtn.textContent='Cancel'; closeBtn.style.marginLeft='8px'; closeBtn.onclick=()=>pop.remove();
-        pop.append(saveBtn,closeBtn);
-        document.body.appendChild(pop);
+
+        rows.forEach(({ del }) => {
+            del.onclick = () => {
+                if (del.dataset._deleted === '1') {
+                    del.dataset._deleted = '0';
+                    del.textContent = 'Delete';
+                    del.style.background = '#333';
+                } else {
+                    del.dataset._deleted = '1';
+                    del.textContent = 'Undelete';
+                    del.style.background = '#a33';
+                }
+            };
+        });
+
+        menu.append(
+            title,
+            opacityRow,
+            epColorRow,
+            dayColorRow,
+            epLenRow,
+            labelRow,
+            rollRow,
+            editsTitle,
+            editsWrap,
+            buttons
+        );
+        document.body.appendChild(menu);
+
+        // small builders (local to settings)
+        function mkNum(label, value, min, max, step, width = '80px') {
+            const wrap = document.createElement('label');
+            wrap.style.display = 'flex';
+            wrap.style.justifyContent = 'space-between';
+            wrap.style.alignItems = 'center';
+            wrap.style.margin = '8px 0';
+            const span = document.createElement('span');
+            span.textContent = label;
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.value = value;
+            input.min = min;
+            input.max = max;
+            input.step = step;
+            Object.assign(input.style, {
+                background: '#222',
+                color: 'white',
+                border: '1px solid #666',
+                borderRadius: '4px',
+                width,
+                padding: '4px',
+                marginLeft: '10px'
+            });
+            wrap.append(span, input);
+            return [wrap, input];
+        }
+
+        function mkColor(label, value) {
+            const wrap = document.createElement('label');
+            wrap.style.display = 'flex';
+            wrap.style.justifyContent = 'space-between';
+            wrap.style.alignItems = 'center';
+            wrap.style.margin = '8px 0';
+            const span = document.createElement('span');
+            span.textContent = label;
+            const input = document.createElement('input');
+            input.type = 'color';
+            input.value = value;
+            input.style.marginLeft = '10px';
+            wrap.append(span, input);
+            return [wrap, input];
+        }
+
+        function mkText(label, value, width = '180px') {
+            const wrap = document.createElement('label');
+            wrap.style.display = 'flex';
+            wrap.style.justifyContent = 'space-between';
+            wrap.style.alignItems = 'center';
+            wrap.style.margin = '8px 0';
+            const span = document.createElement('span');
+            span.textContent = label;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value;
+            Object.assign(input.style, {
+                background: '#222',
+                color: 'white',
+                border: '1px solid #666',
+                borderRadius: '4px',
+                width,
+                padding: '4px',
+                marginLeft: '10px'
+            });
+            wrap.append(span, input);
+            return [wrap, input];
+        }
     }
 
-    /* ===================================================================
-                                  REFRESH HUD
-       =================================================================== */
-    function refreshHUD(){
-        const ep=markedEpisodes[todayKey()]||0; epCountTxt.textContent=`Watched: ${ep}/${EPISODES_PER_DAY}`;
-        renderReadBar();
-        renderEpGrid();
-        const f=dailyFlags[todayKey()]||{};
-        srsBtn.style.background   = f.srs   ? '#00695c' : '#333';
-        speakBtn.style.background = f.speak ? '#00695c' : '#333';
-        skipBtn.style.background  = f.skip  ? '#00695c' : '#333';
+    function updateAvgLabel() {
+        const windowSize = MIN_WIN();
+        const arr = getDurations(settings.showLabel);
+        const text = arr.length ? fmtHMSsec(avgSecondsPerEpisode(settings.showLabel)) : '--:--:--';
+        swAvg.textContent = `Avg/${windowSize}: ${text}`;
     }
 
-    function updatePlayBar(){
-        const v=document.querySelector('video');
-        const pct=(v&&v.duration)?v.currentTime/v.duration:0;
-        const filled=Math.round(pct*10);
-        playPercent.textContent=`Episode progress: ${(pct*100).toFixed(0)}%`;
-        [...epBar.children].forEach((b,i)=>{ b.style.background=i<filled?'#2196f3':'transparent'; });
+    // ----- UI refresh -----
+    function secondsLeftToGoal(watchedWhole, currentPercent) {
+        const projected = watchedWhole + currentPercent / 100;
+        const remainingEpisodes = Math.max(0, EPISODES_PER_DAY - projected);
+        const secPerEpisode = avgSecondsPerEpisode(settings.showLabel);
+        return Math.ceil(remainingEpisodes * secPerEpisode);
     }
 
-    setInterval(()=>{ if(!document.body.contains(hud)) document.body.appendChild(hud); },HUD_KEEPALIVE_MS);
-    setInterval(updatePlayBar,1000);
-    refreshHUD(); updatePlayBar();
+    function updateUI() {
+        const today = getTodayLocal();
+        const watched = markedEpisodes[today] || 0;
+        const projected = watched + currentEpisodePercent / 100;
+        const percent = Math.min(100, (projected / EPISODES_PER_DAY) * 100);
+
+        const secsLeft = secondsLeftToGoal(watched, currentEpisodePercent);
+        const timeLabel = secsLeft <= 0 ? 'done 🎉' : `${fmtHMSsec(secsLeft)} left`;
+        dailyLine.textContent = `Daily: ${percent.toFixed(1)}% • ${timeLabel}`;
+
+        episodeText.textContent = `Episode: ${currentEpisodePercent.toFixed(1)}%`;
+        Array.from(episodeBar.children).forEach((box, i) => {
+            box.style.backgroundColor =
+                i < Math.floor(currentEpisodePercent / 10) ? settings.episodeColor : 'transparent';
+        });
+
+        updateAvgLabel();
+        refreshDayBoxesIfNeeded();
+        applyVisibility();
+    }
+
+    // Progress loop
+    function updateProgress() {
+        const video = document.querySelector('video');
+        currentEpisodePercent =
+            video && video.duration ? (video.currentTime / video.duration) * 100 : 0;
+        updateUI();
+    }
+
+    // Mount
+    document.body.appendChild(overlay);
+    swUpdateClock();
+    updateUI();
+    setInterval(updateProgress, 1000);
 })();
