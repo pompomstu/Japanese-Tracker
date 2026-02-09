@@ -12,7 +12,7 @@
     'use strict';
 
     /* ---------------- USER‑TWEAKABLE CONSTANTS ---------------- */
-    const EPISODES_PER_DAY = 12;   // Anime goal
+    const EPISODES_PER_DAY = 12;   // Anime goal (default)
     const CHAPTERS_PER_DAY = 5;    // Manga chapters/day
     const HUD_KEEPALIVE_MS = 2500; // how often to make sure the HUD is still in the DOM
     /* ---------------------------------------------------------- */
@@ -32,7 +32,14 @@
     const dateKey  = d   =>{d.setHours(0,0,0,0);return d.toISOString().split('T')[0];};
 
     /* ---------- settings with default fall‑backs ---------- */
-    let settings = load(KEYS.SETTINGS,{ opacity:0.7, episodeColor:'#0f0', dailyColor:'#0f0' });
+    let settings = load(KEYS.SETTINGS,{
+        opacity:0.7,
+        episodeColor:'#0f0',
+        dailyColor:'#0f0',
+        episodesPerDay: EPISODES_PER_DAY,
+        gridRows: 2,
+        gridCols: 6
+    });
 
     /* ---------- data buckets ---------- */
     let markedEpisodes  = load(KEYS.MARKED   ,{});
@@ -102,20 +109,35 @@
     const epBar=makeRow(10,0,null,'#2196f3',18,6); epBar.style.marginTop='2px'; epSec.appendChild(epBar);
     const epCountTxt=document.createElement('div'); epCountTxt.style.marginTop='6px'; epSec.appendChild(epCountTxt);
 
+    const clampInt = (value, min, max, fallback) => {
+        const num = Number.isFinite(value) ? Math.round(value) : fallback;
+        return Math.max(min, Math.min(max, num));
+    };
+
+    function getGridConfig() {
+        const rows = clampInt(settings.gridRows, 1, 12, 2);
+        const cols = clampInt(settings.gridCols, 1, 12, 6);
+        const maxEpisodes = rows * cols;
+        const episodesPerDay = clampInt(settings.episodesPerDay, 1, maxEpisodes, maxEpisodes);
+        return { rows, cols, episodesPerDay, maxEpisodes };
+    }
+
     function renderEpGrid(){
         const old=epSec.querySelector('.ep‑grid'); if(old) old.remove();
         const g=document.createElement('div'); g.className='ep‑grid'; g.style.display='flex'; g.style.flexDirection='column'; g.style.gap='4px';
-        for(let r=0;r<2;r++){
+        const { rows, cols, episodesPerDay } = getGridConfig();
+        for(let r=0;r<rows;r++){
             const row=document.createElement('div'); row.style.display='flex'; row.style.gap='8px';
-            for(let p=0;p<3;p++){
-                const start=r*6+p*2;
-                const filled=Math.max(0,Math.min(2,(markedEpisodes[todayKey()]||0)-start));
-                const pair=makeRow(2,filled,i=>{
-                    const idx=start+i; const cur=markedEpisodes[todayKey()]||0;
-                    markedEpisodes[todayKey()] = idx<cur ? cur-1 : cur+1;
+            for(let c=0;c<cols;c++){
+                const index = r * cols + c;
+                const filled = index < (markedEpisodes[todayKey()]||0) ? 1 : 0;
+                const box = makeRow(1, filled, index < episodesPerDay ? () => {
+                    const cur=markedEpisodes[todayKey()]||0;
+                    markedEpisodes[todayKey()] = index < cur ? cur-1 : cur+1;
+                    markedEpisodes[todayKey()] = Math.max(0, Math.min(episodesPerDay, markedEpisodes[todayKey()]));
                     save(KEYS.MARKED,markedEpisodes); refreshHUD();
-                },settings.dailyColor);
-                row.appendChild(pair);
+                } : null, settings.dailyColor);
+                row.appendChild(box);
             }
             g.appendChild(row);
         }
@@ -180,13 +202,23 @@
 
         const op=document.createElement('input'); Object.assign(op,{type:'number',step:'0.1',min:0,max:1,value:settings.opacity}); styliseInput(op);
         const col=document.createElement('input'); col.type='color'; col.value=settings.episodeColor;
+        const epGoal=document.createElement('input'); Object.assign(epGoal,{type:'number',min:1,max:144,value:settings.episodesPerDay}); styliseInput(epGoal);
+        const gridRows=document.createElement('input'); Object.assign(gridRows,{type:'number',min:1,max:12,value:settings.gridRows}); styliseInput(gridRows);
+        const gridCols=document.createElement('input'); Object.assign(gridCols,{type:'number',min:1,max:12,value:settings.gridCols}); styliseInput(gridCols);
 
         pop.appendChild(mkRow('Panel opacity',op));
         pop.appendChild(mkRow('Episode‑grid colour',col));
+        pop.appendChild(mkRow('Episodes per day',epGoal));
+        pop.appendChild(mkRow('Grid rows',gridRows));
+        pop.appendChild(mkRow('Grid columns',gridCols));
 
         const saveBtn=document.createElement('button'); saveBtn.textContent='Save'; saveBtn.style.marginTop='10px'; saveBtn.onclick=()=>{
             settings.opacity = parseFloat(op.value) || settings.opacity;
             settings.episodeColor = col.value || settings.episodeColor;
+            settings.gridRows = clampInt(parseFloat(gridRows.value), 1, 12, settings.gridRows);
+            settings.gridCols = clampInt(parseFloat(gridCols.value), 1, 12, settings.gridCols);
+            const maxEpisodes = settings.gridRows * settings.gridCols;
+            settings.episodesPerDay = clampInt(parseFloat(epGoal.value), 1, maxEpisodes, maxEpisodes);
             save(KEYS.SETTINGS,settings);
             hud.style.background=`rgba(0,0,0,${settings.opacity})`;
             pop.remove(); refreshHUD();
@@ -271,11 +303,12 @@
                     const watched = markedEpisodes[k]||0;
                     const read    = readingChapters[k]||0;
                     const f       = dailyFlags[k]||{};
-                    td.title = `Ep ${watched}/${EPISODES_PER_DAY}\nCh ${read}/${CHAPTERS_PER_DAY}\nSRS:${f.srs?'✔':'✘'} Speak:${f.speak?'✔':'✘'} Skip:${f.skip?'✔':'✘'}`;
+                    const { episodesPerDay } = getGridConfig();
+                    td.title = `Ep ${watched}/${episodesPerDay}\nCh ${read}/${CHAPTERS_PER_DAY}\nSRS:${f.srs?'✔':'✘'} Speak:${f.speak?'✔':'✘'} Skip:${f.skip?'✔':'✘'}`;
                     // color code
                     if(f.skip) {
                         td.style.backgroundColor = '#2196f3'; // blue
-                    } else if(watched>=EPISODES_PER_DAY && read>=CHAPTERS_PER_DAY && f.srs && f.speak) {
+                    } else if(watched>=episodesPerDay && read>=CHAPTERS_PER_DAY && f.srs && f.speak) {
                         td.style.backgroundColor = '#4caf50'; // green
                     } else if(watched===0 && read===0 && !f.srs && !f.speak) {
                         td.style.backgroundColor = '#f44336'; // red
@@ -302,7 +335,8 @@
         Object.assign(pop.style,{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',background:'#111',color:'#fff',padding:'20px',borderRadius:'10px',zIndex:MAX_Z,fontFamily:'Arial',minWidth:'220px'});
         const mkField=(lbl,input)=>{ const w=document.createElement('div'); w.style.margin='8px 0'; const l=document.createElement('span'); l.textContent=lbl; l.style.marginRight='8px'; w.append(l,input); return w; };
 
-        const epInput   = document.createElement('input'); Object.assign(epInput,{type:'number',min:0,max:EPISODES_PER_DAY,value:markedEpisodes[k]||0}); styliseInput(epInput);
+        const { episodesPerDay } = getGridConfig();
+        const epInput   = document.createElement('input'); Object.assign(epInput,{type:'number',min:0,max:episodesPerDay,value:markedEpisodes[k]||0}); styliseInput(epInput);
         const chInput   = document.createElement('input'); Object.assign(chInput,{type:'number',min:0,max:CHAPTERS_PER_DAY,value:readingChapters[k]||0}); styliseInput(chInput);
         const srsChk    = document.createElement('input'); srsChk.type='checkbox'; srsChk.checked=(dailyFlags[k]||{}).srs||false;
         const speakChk  = document.createElement('input'); speakChk.type='checkbox'; speakChk.checked=(dailyFlags[k]||{}).speak||false;
@@ -332,7 +366,13 @@
                                   REFRESH HUD
        =================================================================== */
     function refreshHUD(){
-        const ep=markedEpisodes[todayKey()]||0; epCountTxt.textContent=`Watched: ${ep}/${EPISODES_PER_DAY}`;
+        const { episodesPerDay } = getGridConfig();
+        const ep=markedEpisodes[todayKey()]||0;
+        if (ep > episodesPerDay) {
+            markedEpisodes[todayKey()] = episodesPerDay;
+            save(KEYS.MARKED, markedEpisodes);
+        }
+        epCountTxt.textContent=`Watched: ${markedEpisodes[todayKey()]||0}/${episodesPerDay}`;
         renderReadBar();
         renderEpGrid();
         const f=dailyFlags[todayKey()]||{};
