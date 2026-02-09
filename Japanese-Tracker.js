@@ -246,19 +246,6 @@
 
             for (let row = 0; row < 2; row++) {
                 const index = row * columnsPerRow + col;
-        container.style.flexDirection = 'column';
-        container.style.gap = '4px';
-
-        const columns = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
-        const totalEpisodes = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
-        const rows = Math.max(1, Math.ceil(totalEpisodes / columns));
-
-        for (let row = 0; row < rows; row++) {
-            const rowContainer = document.createElement('div');
-            rowContainer.style.display = 'flex';
-            rowContainer.style.gap = '4px';
-            for (let col = 0; col < columns; col++) {
-                const index = row * columns + col;
                 const todayKey = getTodayLocal();
                 const count = markedEpisodes[todayKey] || 0;
 
@@ -297,7 +284,6 @@
                     marginTop: '1px'
                 });
                 container.appendChild(divider);
-                rowContainer.appendChild(box);
             }
         }
         return container;
@@ -593,7 +579,11 @@
     gearBtn.onclick = () => openSettings();
 
     function openSettings() {
+        const existing = document.getElementById('netflixTrackerSettings');
+        if (existing) existing.remove();
+
         const menu = document.createElement('div');
+        menu.id = 'netflixTrackerSettings';
         Object.assign(menu.style, {
             position: 'fixed',
             top: '50%',
@@ -624,10 +614,9 @@
         const [dayColorRow, dayColorInput] = mkColor('Daily Box', settings.dailyColor);
         const [epLenRow, epLenInput] = mkNum('Fallback ep length (min)', settings.episodeMinutes, 1, 300, 1);
         const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
-        const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+        const [rollRow, rollInput] = mkNum('Avg episode window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
         const [episodesRow, episodesInput] = mkNum('Episodes per day', settings.episodesPerDay, 1, 100, 1, '70px');
         const [columnsRow, columnsInput] = mkNum('Divider every N episodes', settings.dayGridColumns, 1, 20, 1, '70px');
-        const [columnsRow, columnsInput] = mkNum('Daily grid columns', settings.dayGridColumns, 1, 20, 1, '70px');
 
         const editsTitle = document.createElement('div');
         editsTitle.textContent = `Last 5 durations for "${settings.showLabel}"`;
@@ -819,8 +808,6 @@
             episodesRow,
             columnsRow,
             sectionDivider(),
-            episodesRow,
-            columnsRow,
             editsTitle,
             editsWrap,
             buttons
