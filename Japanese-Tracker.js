@@ -231,6 +231,21 @@
     function buildDayBoxContainer() {
         const container = document.createElement('div');
         container.style.display = 'flex';
+        container.style.alignItems = 'flex-start';
+        container.style.gap = '6px';
+
+        const dividerInterval = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
+        const totalEpisodes = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
+        const columnsPerRow = Math.max(1, Math.ceil(totalEpisodes / 2));
+
+        for (let col = 0; col < columnsPerRow; col++) {
+            const column = document.createElement('div');
+            column.style.display = 'flex';
+            column.style.flexDirection = 'column';
+            column.style.gap = '4px';
+
+            for (let row = 0; row < 2; row++) {
+                const index = row * columnsPerRow + col;
         container.style.flexDirection = 'column';
         container.style.gap = '4px';
 
@@ -268,9 +283,22 @@
                         updateUI();
                     });
                 }
+                column.appendChild(box);
+            }
+
+            container.appendChild(column);
+
+            if ((col + 1) % dividerInterval === 0 && col + 1 < columnsPerRow) {
+                const divider = document.createElement('div');
+                Object.assign(divider.style, {
+                    width: '1px',
+                    height: '30px',
+                    backgroundColor: 'rgba(255,255,255,0.4)',
+                    marginTop: '1px'
+                });
+                container.appendChild(divider);
                 rowContainer.appendChild(box);
             }
-            container.appendChild(rowContainer);
         }
         return container;
     }
@@ -578,8 +606,10 @@
             fontFamily: 'Arial, sans-serif',
             zIndex: 10000,
             width: '380px',
+            pointerEvents: 'auto',
             boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
         });
+        menu.addEventListener('mousedown', e => e.stopPropagation());
 
         const title = document.createElement('div');
         title.textContent = 'Settings';
@@ -596,6 +626,7 @@
         const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
         const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
         const [episodesRow, episodesInput] = mkNum('Episodes per day', settings.episodesPerDay, 1, 100, 1, '70px');
+        const [columnsRow, columnsInput] = mkNum('Divider every N episodes', settings.dayGridColumns, 1, 20, 1, '70px');
         const [columnsRow, columnsInput] = mkNum('Daily grid columns', settings.dayGridColumns, 1, 20, 1, '70px');
 
         const editsTitle = document.createElement('div');
@@ -774,12 +805,20 @@
 
         menu.append(
             title,
+            sectionTitle('HUD & Colors'),
             opacityRow,
             epColorRow,
             dayColorRow,
+            sectionDivider(),
+            sectionTitle('Stopwatch'),
             epLenRow,
             labelRow,
             rollRow,
+            sectionDivider(),
+            sectionTitle('Daily Goal Layout'),
+            episodesRow,
+            columnsRow,
+            sectionDivider(),
             episodesRow,
             columnsRow,
             editsTitle,
@@ -854,6 +893,26 @@
             });
             wrap.append(span, input);
             return [wrap, input];
+        }
+
+        function sectionDivider() {
+            const divider = document.createElement('div');
+            Object.assign(divider.style, {
+                height: '1px',
+                background: 'rgba(255,255,255,0.15)',
+                margin: '10px 0'
+            });
+            return divider;
+        }
+
+        function sectionTitle(text) {
+            const heading = document.createElement('div');
+            heading.textContent = text;
+            Object.assign(heading.style, {
+                fontWeight: 'bold',
+                marginTop: '6px'
+            });
+            return heading;
         }
     }
 
