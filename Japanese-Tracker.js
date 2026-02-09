@@ -11,7 +11,8 @@
     'use strict';
 
     // ---------- Config ----------
-    const EPISODES_PER_DAY = 12;
+    const DEFAULT_EPISODES_PER_DAY = 12;
+    const DEFAULT_DAY_GRID_COLUMNS = 6;
     const ROLLING_DEFAULT = 5;  // minimum enforced
     const KEYS = {
         SETTINGS:   'netflixAnimeSettings',
@@ -80,10 +81,14 @@
         dailyColor:   '#0f0',
         episodeMinutes: 25,
         showLabel: 'default',
-        rollingWindow: ROLLING_DEFAULT
+        rollingWindow: ROLLING_DEFAULT,
+        episodesPerDay: DEFAULT_EPISODES_PER_DAY,
+        dayGridColumns: DEFAULT_DAY_GRID_COLUMNS
     });
     // Enforce minimum rolling window of 5 on load
     settings.rollingWindow = Math.max(ROLLING_DEFAULT, Math.round(settings.rollingWindow || ROLLING_DEFAULT));
+    settings.episodesPerDay = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
+    settings.dayGridColumns = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
     save(KEYS.SETTINGS, settings);
 
     let durationsByLabel = normalizeDurations(load(KEYS.DURATIONS, {}));
@@ -226,31 +231,60 @@
     function buildDayBoxContainer() {
         const container = document.createElement('div');
         container.style.display = 'flex';
-        container.style.flexDirection = 'column';
-        container.style.gap = '4px';
+        container.style.alignItems = 'flex-start';
+        container.style.gap = '6px';
 
-        for (let row = 0; row < 2; row++) {
-            const rowContainer = document.createElement('div');
-            rowContainer.style.display = 'flex';
-            rowContainer.style.gap = '8px';
-            for (let pair = 0; pair < 3; pair++) {
-                const startIndex = row * 6 + pair * 2;
+        const dividerInterval = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
+        const totalEpisodes = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
+        const columnsPerRow = Math.max(1, Math.ceil(totalEpisodes / 2));
+
+        for (let col = 0; col < columnsPerRow; col++) {
+            const column = document.createElement('div');
+            column.style.display = 'flex';
+            column.style.flexDirection = 'column';
+            column.style.gap = '4px';
+
+            for (let row = 0; row < 2; row++) {
+                const index = row * columnsPerRow + col;
                 const todayKey = getTodayLocal();
-                const filledCount = Math.max(
-                    0,
-                    Math.min(2, (markedEpisodes[todayKey] || 0) - startIndex)
-                );
-                const boxPair = createBoxRow(2, filledCount, i => {
-                    const clickedIndex = startIndex + i;
-                    const count = markedEpisodes[todayKey] || 0;
-                    markedEpisodes[todayKey] = clickedIndex < count ? count - 1 : count + 1;
-                    markedEpisodes[todayKey] = Math.max(0, Math.min(EPISODES_PER_DAY, markedEpisodes[todayKey]));
-                    save(KEYS.MARKED, markedEpisodes);
-                    updateUI();
-                }, settings.dailyColor);
-                rowContainer.appendChild(boxPair);
+                const count = markedEpisodes[todayKey] || 0;
+
+                const box = document.createElement('div');
+                Object.assign(box.style, {
+                    width: '12px',
+                    height: '12px',
+                    border: '1px solid white',
+                    borderRadius: '2px',
+                    backgroundColor: index < totalEpisodes && index < count ? settings.dailyColor : 'transparent',
+                    cursor: index < totalEpisodes ? 'pointer' : 'default',
+                    visibility: index < totalEpisodes ? 'visible' : 'hidden'
+                });
+
+                if (index < totalEpisodes) {
+                    box.addEventListener('click', () => {
+                        const clickedIndex = index;
+                        const currentCount = markedEpisodes[todayKey] || 0;
+                        markedEpisodes[todayKey] = clickedIndex < currentCount ? currentCount - 1 : currentCount + 1;
+                        markedEpisodes[todayKey] = Math.max(0, Math.min(totalEpisodes, markedEpisodes[todayKey]));
+                        save(KEYS.MARKED, markedEpisodes);
+                        updateUI();
+                    });
+                }
+                column.appendChild(box);
             }
-            container.appendChild(rowContainer);
+
+            container.appendChild(column);
+
+            if ((col + 1) % dividerInterval === 0 && col + 1 < columnsPerRow) {
+                const divider = document.createElement('div');
+                Object.assign(divider.style, {
+                    width: '1px',
+                    height: '30px',
+                    backgroundColor: 'rgba(255,255,255,0.4)',
+                    marginTop: '1px'
+                });
+                container.appendChild(divider);
+            }
         }
         return container;
     }
@@ -575,6 +609,8 @@
         const [epLenRow, epLenInput] = mkNum('Fallback ep length (min)', settings.episodeMinutes, 1, 300, 1);
         const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
         const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+        const [episodesRow, episodesInput] = mkNum('Episodes per day', settings.episodesPerDay, 1, 100, 1, '70px');
+        const [columnsRow, columnsInput] = mkNum('Divider every N episodes', settings.dayGridColumns, 1, 20, 1, '70px');
 
         const editsTitle = document.createElement('div');
         editsTitle.textContent = `Last 5 durations for "${settings.showLabel}"`;
@@ -693,6 +729,18 @@
                 ROLLING_DEFAULT,
                 Math.min(50, Math.round(parseFloat(rollInput.value) || settings.rollingWindow))
             );
+            settings.episodesPerDay = clamp(
+                Math.round(parseFloat(episodesInput.value) || settings.episodesPerDay),
+                1,
+                100,
+                DEFAULT_EPISODES_PER_DAY
+            );
+            settings.dayGridColumns = clamp(
+                Math.round(parseFloat(columnsInput.value) || settings.dayGridColumns),
+                1,
+                20,
+                DEFAULT_DAY_GRID_COLUMNS
+            );
 
             save(KEYS.SETTINGS, settings);
             overlay.style.background = `rgba(0,0,0,${settings.opacity})`;
@@ -746,6 +794,8 @@
             epLenRow,
             labelRow,
             rollRow,
+            episodesRow,
+            columnsRow,
             editsTitle,
             editsWrap,
             buttons
@@ -831,7 +881,7 @@
     // ----- UI refresh -----
     function secondsLeftToGoal(watchedWhole, currentPercent) {
         const projected = watchedWhole + currentPercent / 100;
-        const remainingEpisodes = Math.max(0, EPISODES_PER_DAY - projected);
+        const remainingEpisodes = Math.max(0, settings.episodesPerDay - projected);
         const secPerEpisode = avgSecondsPerEpisode(settings.showLabel);
         return Math.ceil(remainingEpisodes * secPerEpisode);
     }
@@ -840,7 +890,7 @@
         const today = getTodayLocal();
         const watched = markedEpisodes[today] || 0;
         const projected = watched + currentEpisodePercent / 100;
-        const percent = Math.min(100, (projected / EPISODES_PER_DAY) * 100);
+        const percent = Math.min(100, (projected / settings.episodesPerDay) * 100);
 
         const secsLeft = secondsLeftToGoal(watched, currentEpisodePercent);
         const timeLabel = secsLeft <= 0 ? 'done 🎉' : `${fmtHMSsec(secsLeft)} left`;
