@@ -83,12 +83,14 @@
         showLabel: 'default',
         rollingWindow: ROLLING_DEFAULT,
         episodesPerDay: DEFAULT_EPISODES_PER_DAY,
-        dayGridColumns: DEFAULT_DAY_GRID_COLUMNS
+        dayGridColumns: DEFAULT_DAY_GRID_COLUMNS,
+        showPresets: []
     });
     // Enforce minimum rolling window of 5 on load
     settings.rollingWindow = Math.max(ROLLING_DEFAULT, Math.round(settings.rollingWindow || ROLLING_DEFAULT));
     settings.episodesPerDay = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
     settings.dayGridColumns = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
+    settings.showPresets = Array.isArray(settings.showPresets) ? settings.showPresets : [];
     save(KEYS.SETTINGS, settings);
 
     let durationsByLabel = normalizeDurations(load(KEYS.DURATIONS, {}));
@@ -246,19 +248,6 @@
 
             for (let row = 0; row < 2; row++) {
                 const index = row * columnsPerRow + col;
-        container.style.flexDirection = 'column';
-        container.style.gap = '4px';
-
-        const columns = clamp(Math.round(settings.dayGridColumns || DEFAULT_DAY_GRID_COLUMNS), 1, 20, DEFAULT_DAY_GRID_COLUMNS);
-        const totalEpisodes = clamp(Math.round(settings.episodesPerDay || DEFAULT_EPISODES_PER_DAY), 1, 100, DEFAULT_EPISODES_PER_DAY);
-        const rows = Math.max(1, Math.ceil(totalEpisodes / columns));
-
-        for (let row = 0; row < rows; row++) {
-            const rowContainer = document.createElement('div');
-            rowContainer.style.display = 'flex';
-            rowContainer.style.gap = '4px';
-            for (let col = 0; col < columns; col++) {
-                const index = row * columns + col;
                 const todayKey = getTodayLocal();
                 const count = markedEpisodes[todayKey] || 0;
 
@@ -297,7 +286,6 @@
                     marginTop: '1px'
                 });
                 container.appendChild(divider);
-                rowContainer.appendChild(box);
             }
         }
         return container;
@@ -593,7 +581,11 @@
     gearBtn.onclick = () => openSettings();
 
     function openSettings() {
+        const existing = document.getElementById('netflixTrackerSettings');
+        if (existing) existing.remove();
+
         const menu = document.createElement('div');
+        menu.id = 'netflixTrackerSettings';
         Object.assign(menu.style, {
             position: 'fixed',
             top: '50%',
@@ -624,10 +616,10 @@
         const [dayColorRow, dayColorInput] = mkColor('Daily Box', settings.dailyColor);
         const [epLenRow, epLenInput] = mkNum('Fallback ep length (min)', settings.episodeMinutes, 1, 300, 1);
         const [labelRow, labelInput] = mkText('Show label', settings.showLabel);
-        const [rollRow, rollInput] = mkNum('Rolling window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
+        const [presetRow, presetSelect, presetAddBtn, presetRemoveBtn] = mkPresetControls('Show presets');
+        const [rollRow, rollInput] = mkNum('Avg episode window (min 5)', settings.rollingWindow, 5, 50, 1, '70px');
         const [episodesRow, episodesInput] = mkNum('Episodes per day', settings.episodesPerDay, 1, 100, 1, '70px');
         const [columnsRow, columnsInput] = mkNum('Divider every N episodes', settings.dayGridColumns, 1, 20, 1, '70px');
-        const [columnsRow, columnsInput] = mkNum('Daily grid columns', settings.dayGridColumns, 1, 20, 1, '70px');
 
         const editsTitle = document.createElement('div');
         editsTitle.textContent = `Last 5 durations for "${settings.showLabel}"`;
@@ -813,14 +805,13 @@
             sectionTitle('Stopwatch'),
             epLenRow,
             labelRow,
+            presetRow,
             rollRow,
             sectionDivider(),
             sectionTitle('Daily Goal Layout'),
             episodesRow,
             columnsRow,
             sectionDivider(),
-            episodesRow,
-            columnsRow,
             editsTitle,
             editsWrap,
             buttons
@@ -893,6 +884,93 @@
             });
             wrap.append(span, input);
             return [wrap, input];
+        }
+
+        function mkPresetControls(label) {
+            const wrap = document.createElement('label');
+            wrap.style.display = 'flex';
+            wrap.style.justifyContent = 'space-between';
+            wrap.style.alignItems = 'center';
+            wrap.style.margin = '8px 0';
+
+            const span = document.createElement('span');
+            span.textContent = label;
+
+            const controlWrap = document.createElement('div');
+            controlWrap.style.display = 'flex';
+            controlWrap.style.alignItems = 'center';
+            controlWrap.style.gap = '6px';
+
+            const select = document.createElement('select');
+            Object.assign(select.style, {
+                background: '#222',
+                color: 'white',
+                border: '1px solid #666',
+                borderRadius: '4px',
+                padding: '4px',
+                width: '140px'
+            });
+
+            const addBtn = document.createElement('button');
+            addBtn.textContent = 'Add';
+            styleBtn(addBtn);
+            addBtn.style.padding = '3px 8px';
+
+            const removeBtn = document.createElement('button');
+            removeBtn.textContent = 'Remove';
+            styleBtn(removeBtn);
+            removeBtn.style.padding = '3px 8px';
+
+            const buildPresetOptions = () => {
+                const labels = new Set([
+                    ...settings.showPresets,
+                    ...Object.keys(durationsByLabel || {}),
+                    (labelInput.value || settings.showLabel || '').trim()
+                ].filter(Boolean));
+                const ordered = Array.from(labels).sort((a, b) => a.localeCompare(b));
+
+                select.innerHTML = '';
+                ordered.forEach(value => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value;
+                    select.appendChild(option);
+                });
+                if (ordered.length) {
+                    select.value = (labelInput.value || settings.showLabel || '').trim() || ordered[0];
+                }
+                removeBtn.disabled = !ordered.length;
+            };
+
+            select.addEventListener('change', () => {
+                labelInput.value = select.value;
+            });
+
+            addBtn.addEventListener('click', () => {
+                const value = (labelInput.value || '').trim();
+                if (!value) return;
+                if (!settings.showPresets.includes(value)) {
+                    settings.showPresets.push(value);
+                    settings.showPresets.sort((a, b) => a.localeCompare(b));
+                    save(KEYS.SETTINGS, settings);
+                }
+                buildPresetOptions();
+                select.value = value;
+            });
+
+            removeBtn.addEventListener('click', () => {
+                const value = select.value;
+                if (!value) return;
+                settings.showPresets = settings.showPresets.filter(item => item !== value);
+                save(KEYS.SETTINGS, settings);
+                buildPresetOptions();
+            });
+
+            buildPresetOptions();
+
+            controlWrap.append(select, addBtn, removeBtn);
+            wrap.append(span, controlWrap);
+            return [wrap, select, addBtn, removeBtn];
         }
 
         function sectionDivider() {
